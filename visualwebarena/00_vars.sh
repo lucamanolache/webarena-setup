@@ -24,3 +24,5 @@ WIKIPEDIA_URL="http://${PUBLIC_HOSTNAME}:${WIKIPEDIA_PORT}/wikipedia_en_all_maxi
 #  - wikipedia_en_all_maxi_2022-05.zim
 
 ARCHIVES_LOCATION="./"
+
+CHECKPOINT_DIR="./checkpoints"

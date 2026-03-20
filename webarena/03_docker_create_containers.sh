@@ -7,11 +7,11 @@ source 00_vars.sh
 
 WORKING_DIR=$(pwd)
 
-docker create --name shopping -p $SHOPPING_PORT:80 shopping_final_0712
-docker create --name shopping_admin -p $SHOPPING_ADMIN_PORT:80 shopping_admin_final_0719
-docker create --name forum -p $REDDIT_PORT:80 postmill-populated-exposed-withimg
-docker create --name gitlab -p $GITLAB_PORT:$GITLAB_PORT gitlab-populated-final-port8023 /opt/gitlab/embedded/bin/runsvdir-start --env GITLAB_PORT=$GITLAB_PORT
-docker create --name wikipedia --volume=${WORKING_DIR}/wiki/:/data -p $WIKIPEDIA_PORT:80 ghcr.io/kiwix/kiwix-serve:3.3.0 wikipedia_en_all_maxi_2022-05.zim
+podman create --name shopping -p $SHOPPING_PORT:80 shopping_final_0712
+podman create --name shopping_admin -p $SHOPPING_ADMIN_PORT:80 shopping_admin_final_0719
+podman create --name forum -p $REDDIT_PORT:80 postmill-populated-exposed-withimg
+podman create --name gitlab -p $GITLAB_PORT:$GITLAB_PORT gitlab-populated-final-port8023 /opt/gitlab/embedded/bin/runsvdir-start --env GITLAB_PORT=$GITLAB_PORT
+podman create --name wikipedia --volume=${WORKING_DIR}/wiki/:/data -p $WIKIPEDIA_PORT:80 ghcr.io/kiwix/kiwix-serve:3.3.0 wikipedia_en_all_maxi_2022-05.zim
 
 # openstreetmap docker set up
 cd openstreetmap-website/
@@ -59,4 +59,26 @@ sed "${SED_INPLACE[@]}" "s|__OSMCarSuffix__|${OSM_CAR_SUFFIX}|g" ./app/assets/ja
 sed "${SED_INPLACE[@]}" "s|__OSMBikeSuffix__|${OSM_BIKE_SUFFIX}|g" ./app/assets/javascripts/index/directions/fossgis_osrm.js
 sed "${SED_INPLACE[@]}" "s|__OSMFootSuffix__|${OSM_FOOT_SUFFIX}|g" ./app/assets/javascripts/index/directions/fossgis_osrm.js
 
-docker compose create
+# Create podman network for OSM (db <-> web communication)
+podman network create osm-net 2>/dev/null || true
+
+# OSM database
+podman create --name openstreetmap-website-db-1 \
+  --network osm-net \
+  -p 54321:5432 \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -e POSTGRES_DB=openstreetmap \
+  -v osm-db-data:/var/lib/postgresql/data \
+  openstreetmap-website-db
+
+# OSM web server
+podman create --name openstreetmap-website-web-1 \
+  --network osm-net \
+  -p ${MAP_PORT}:3000 \
+  -e PIDFILE=/tmp/pids/server.pid \
+  --tmpfs /tmp/pids/ \
+  -v ${WORKING_DIR}/openstreetmap-website:/app \
+  -v osm-web-tmp:/app/tmp \
+  -v osm-web-storage:/app/storage \
+  openstreetmap-website-web \
+  bundle exec rails s -p 3000 -b '0.0.0.0'
