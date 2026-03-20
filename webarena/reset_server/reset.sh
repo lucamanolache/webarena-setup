@@ -5,8 +5,7 @@ cd ..
 source 00_vars.sh
 
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints}"
-CONTAINERS=(shopping shopping_admin forum gitlab wikipedia
-            openstreetmap-website-db-1 openstreetmap-website-web-1)
+CONTAINERS=(shopping shopping_admin forum gitlab wikipedia)
 
 # Stop and remove existing containers
 for container in "${CONTAINERS[@]}"; do

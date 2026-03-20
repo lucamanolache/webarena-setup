@@ -5,8 +5,7 @@ source 00_vars.sh
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints}"
 mkdir -p "$CHECKPOINT_DIR"
 
-CONTAINERS=(shopping shopping_admin forum gitlab wikipedia
-            openstreetmap-website-db-1 openstreetmap-website-web-1)
+CONTAINERS=(shopping shopping_admin forum gitlab wikipedia)
 
 for container in "${CONTAINERS[@]}"; do
   echo "Checkpointing ${container}..."

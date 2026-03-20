@@ -24,13 +24,10 @@ podman start shopping
 podman start shopping_admin
 podman start forum
 podman start wikipedia
-podman start openstreetmap-website-db-1
-podman start openstreetmap-website-web-1
 
 echo "Waiting for services to be ready..."
 wait_for_container shopping "curl -sf http://localhost"
 wait_for_container shopping_admin "curl -sf http://localhost"
 wait_for_container forum "curl -sf http://localhost"
 wait_for_container wikipedia "curl -sf http://localhost"
-wait_for_container openstreetmap-website-web-1 "curl -sf http://localhost:3000"
 echo "All services ready"
