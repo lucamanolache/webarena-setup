@@ -592,11 +592,16 @@ class HotSwapServer:
     def init(self):
         """First-time setup: create all pool instances and configure iptables."""
         self._init_static_services()
-        logger.info("=== Initializing all service pools ===")
+        logger.info("=== Initializing all service pools in parallel ===")
+        threads = []
         for name, config in self.services_config.items():
             pool = ServicePool(name, config)
-            pool.init_all()
             self.pools[name] = pool
+            t = threading.Thread(target=pool.init_all, name=f"init-{name}")
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
         self._save_state()
         logger.info("=== Initialization complete ===")
 
@@ -735,15 +740,13 @@ def main():
             server_instance.teardown()
 
     signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(0)))
     atexit.register(cleanup)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
+    httpd.allow_reuse_address = True
     logger.info("Serving on port %d...", args.port)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        httpd.server_close()
+    httpd.serve_forever()
 
 
 if __name__ == "__main__":
