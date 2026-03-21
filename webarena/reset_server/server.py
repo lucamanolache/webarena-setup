@@ -44,7 +44,7 @@ logger.addHandler(handler)
 #   - type "exec": run a command inside the container
 #   - type "http": curl a URL from the host
 
-WORKING_DIR = os.environ.get("WEBARENA_WORKING_DIR", os.path.expanduser("~/webarena-setup/webarena"))
+WORKING_DIR = os.environ.get("WEBARENA_WORKING_DIR", "/home/luca/webarena-setup/webarena")
 
 SERVICES = {
     "shopping": {
@@ -388,12 +388,27 @@ class ServicePool:
                 return idx
         return None
 
+    def _spawn_extra(self):
+        """Add a new instance to the pool in the background."""
+        new_idx = self.pool_size
+        self.pool_size += 1
+        self.instances[new_idx] = "rebuilding"
+        logger.info("[%s] Spawning extra instance %d (pool now %d)",
+                    self.name, new_idx, self.pool_size)
+        t = threading.Thread(
+            target=self._rebuild, args=(new_idx,),
+            name=f"spawn-{self.name}-{new_idx}", daemon=True,
+        )
+        t.start()
+
     def swap(self) -> tuple[bool, str]:
         """Swap to next ready instance. Returns (success, message)."""
         with self.lock:
             next_idx = self.get_next_ready()
             if next_idx is None:
-                return False, f"No ready standby for: {self.name}"
+                # No standby ready — spawn an extra instance for next time
+                self._spawn_extra()
+                return False, f"No ready standby for: {self.name} (spawning extra)"
 
             old_idx = self.active
 
@@ -404,6 +419,10 @@ class ServicePool:
             self.instances[next_idx] = "active"
             self.instances[old_idx] = "rebuilding"
             self.active = next_idx
+
+            # If no more standbys after this swap, grow the pool
+            if self.ready_count() == 0:
+                self._spawn_extra()
 
             logger.info("[%s] Swapped %d → %d", self.name, old_idx, next_idx)
 
