@@ -158,7 +158,7 @@ def run(cmd: list[str], check: bool = True, timeout: int = 30) -> subprocess.Com
 # ---------------------------------------------------------------------------
 
 def _iptables_delete_rules(public_port: int):
-    """Remove all existing REDIRECT rules for `public_port` in nat table."""
+    """Remove all existing REDIRECT/DNAT rules for `public_port` in nat table."""
     for chain in ("PREROUTING", "OUTPUT"):
         while True:
             # List rules with line numbers
@@ -166,11 +166,10 @@ def _iptables_delete_rules(public_port: int):
                 ["iptables", "-t", "nat", "-L", chain, "--line-numbers", "-n"],
                 capture_output=True, text=True, check=False,
             )
-            # Find lines matching our dport
+            # Find lines matching our dport (REDIRECT or DNAT)
             found = False
             for line in reversed(r.stdout.splitlines()):
-                # Lines look like:  "1    REDIRECT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:8082 redir ports 18082"
-                if f"dpt:{public_port}" in line and "REDIRECT" in line:
+                if f"dpt:{public_port}" in line and ("REDIRECT" in line or "DNAT" in line):
                     line_num = line.split()[0]
                     subprocess.run(
                         ["iptables", "-t", "nat", "-D", chain, line_num],
@@ -195,11 +194,12 @@ def set_redirect(public_port: int, target_port: int):
          "-j", "REDIRECT", "--to-port", str(target_port)],
         check=True,
     )
-    # OUTPUT: locally-generated traffic (health checks, curl from host, etc.)
+    # OUTPUT: locally-generated traffic — use DNAT to 127.0.0.1:target_port
+    # (REDIRECT doesn't work reliably in OUTPUT for locally-generated packets)
     subprocess.run(
         ["iptables", "-t", "nat", "-I", "OUTPUT", "1",
          "-p", "tcp", "--dport", str(public_port),
-         "-j", "REDIRECT", "--to-port", str(target_port)],
+         "-j", "DNAT", "--to-destination", f"127.0.0.1:{target_port}"],
         check=True,
     )
     logger.info("iptables: %d → %d", public_port, target_port)
