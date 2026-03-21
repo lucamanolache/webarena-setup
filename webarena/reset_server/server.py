@@ -174,6 +174,9 @@ def _write_nginx_conf():
         proxy_pass http://127.0.0.1:{target_port};
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffer_size 16k;
+        proxy_busy_buffers_size 24k;
+        proxy_buffers 8 16k;
     }}
 }}""")
     conf = "\n\n".join(blocks) + "\n"
