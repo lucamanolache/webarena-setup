@@ -99,6 +99,40 @@ SERVICES = {
     },
 }
 
+# Static services: started once, never reset or pooled.
+# Each entry is a list of containers that are started together.
+STATIC_SERVICES = {
+    "openstreetmap": [
+        {
+            "name": "openstreetmap-website-db-1",
+            "image": "openstreetmap-website-db",
+            "port_mapping": "54321:5432",
+            "extra_args": ["--network", "osm-net", "--network-alias", "db"],
+            "env": {"POSTGRES_HOST_AUTH_METHOD": "trust", "POSTGRES_DB": "openstreetmap"},
+            "volumes": {"osm-db-data": "/var/lib/postgresql/data"},
+            "health_check": None,
+        },
+        {
+            "name": "openstreetmap-website-web-1",
+            "image": "openstreetmap-website-web",
+            "port_mapping": "443:3000",
+            "extra_args": [
+                "--network", "osm-net", "--network-alias", "web",
+                "-e", "PIDFILE=/tmp/pids/server.pid",
+                "--tmpfs", "/tmp/pids/",
+            ],
+            "volumes": {
+                f"{WORKING_DIR}/openstreetmap-website": "/app",
+                "osm-web-node-modules": "/app/node_modules",
+                "osm-web-tmp": "/app/tmp",
+                "osm-web-storage": "/app/storage",
+            },
+            "cmd": ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"],
+            "health_check": {"type": "exec", "cmd": "curl -sf http://localhost:3000", "timeout": 120},
+        },
+    ],
+}
+
 STATE_FILE = os.path.join(os.path.dirname(__file__), "pool_state.json")
 
 # ---------------------------------------------------------------------------
@@ -479,8 +513,9 @@ class ServicePool:
 # ---------------------------------------------------------------------------
 
 class HotSwapServer:
-    def __init__(self, services_config: dict, state_file: str):
+    def __init__(self, services_config: dict, static_services: dict, state_file: str):
         self.services_config = services_config
+        self.static_services = static_services
         self.state_file = state_file
         self.pools: dict[str, ServicePool] = {}
         self._save_lock = threading.Lock()
@@ -502,8 +537,61 @@ class HotSwapServer:
                 json.dump(state, f, indent=2)
             os.replace(tmp, self.state_file)
 
+    def _init_static_services(self):
+        """Start static (non-resettable) services."""
+        # Ensure podman network exists for OSM
+        subprocess.run(["podman", "network", "create", "osm-net"],
+                       capture_output=True, check=False)
+        for svc_name, containers in self.static_services.items():
+            logger.info("=== Starting static service: %s ===", svc_name)
+            for spec in containers:
+                name = spec["name"]
+                cm.stop(name)
+                cm.rm(name)
+                ok = cm.create(
+                    name=name,
+                    image=spec["image"],
+                    port_mapping=spec["port_mapping"],
+                    extra_args=spec.get("extra_args"),
+                    cmd=spec.get("cmd"),
+                    env=spec.get("env"),
+                    volumes=spec.get("volumes"),
+                )
+                if not ok:
+                    logger.error("Failed to create static container %s", name)
+                    continue
+                cm.start(name)
+
+            # Health-check static containers
+            for spec in containers:
+                hc = spec.get("health_check")
+                if not hc:
+                    continue
+                name = spec["name"]
+                logger.info("Health-checking static container %s...", name)
+                if hc["type"] == "exec":
+                    ok = cm.health_check_exec(name, hc["cmd"], hc.get("timeout", 60))
+                elif hc["type"] == "http":
+                    ok = cm.health_check_http(hc["url"], hc.get("timeout", 60))
+                else:
+                    ok = False
+                if ok:
+                    logger.info("  %s ready", name)
+                else:
+                    logger.error("  %s failed health check", name)
+
+    def _teardown_static_services(self):
+        """Stop and remove static service containers."""
+        for svc_name, containers in self.static_services.items():
+            for spec in containers:
+                name = spec["name"]
+                logger.info("Stopping static container %s...", name)
+                cm.stop(name)
+                cm.rm(name)
+
     def init(self):
         """First-time setup: create all pool instances and configure iptables."""
+        self._init_static_services()
         logger.info("=== Initializing all service pools ===")
         for name, config in self.services_config.items():
             pool = ServicePool(name, config)
@@ -514,6 +602,8 @@ class HotSwapServer:
 
     def resume(self):
         """Resume from persisted state. Re-establish iptables rules."""
+        self._init_static_services()
+
         saved = self._load_state()
         if not saved:
             logger.error("No state file found. Run with --init first.")
@@ -573,6 +663,7 @@ class HotSwapServer:
         # Clean up iptables rules
         for name, pool in self.pools.items():
             _iptables_delete_rules(pool.public_port)
+        self._teardown_static_services()
         logger.info("=== Teardown complete ===")
 
 
@@ -627,7 +718,7 @@ def main():
     parser.add_argument("--state-file", default=STATE_FILE, help="Path to state JSON file")
     args = parser.parse_args()
 
-    server_instance = HotSwapServer(SERVICES, args.state_file)
+    server_instance = HotSwapServer(SERVICES, STATIC_SERVICES, args.state_file)
 
     if args.init:
         server_instance.init()
