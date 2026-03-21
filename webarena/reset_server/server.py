@@ -233,12 +233,15 @@ class ContainerManager:
         """Poll `podman exec <name> sh -c <cmd>` until success or timeout."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            r = subprocess.run(
-                ["podman", "exec", name, "sh", "-c", cmd],
-                capture_output=True, text=True, check=False, timeout=15,
-            )
-            if r.returncode == 0:
-                return True
+            try:
+                r = subprocess.run(
+                    ["podman", "exec", name, "sh", "-c", cmd],
+                    capture_output=True, text=True, check=False, timeout=15,
+                )
+                if r.returncode == 0:
+                    return True
+            except subprocess.TimeoutExpired:
+                pass
             time.sleep(2)
         return False
 
