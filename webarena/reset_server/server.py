@@ -154,55 +154,47 @@ def run(cmd: list[str], check: bool = True, timeout: int = 30) -> subprocess.Com
     return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
 
 # ---------------------------------------------------------------------------
-# iptables management
+# nginx reverse-proxy management
 # ---------------------------------------------------------------------------
 
-def _iptables_delete_rules(public_port: int):
-    """Remove all existing REDIRECT/DNAT rules for `public_port` in nat table."""
-    for chain in ("PREROUTING", "OUTPUT"):
-        while True:
-            # List rules with line numbers
-            r = subprocess.run(
-                ["iptables", "-t", "nat", "-L", chain, "--line-numbers", "-n"],
-                capture_output=True, text=True, check=False,
-            )
-            # Find lines matching our dport (REDIRECT or DNAT)
-            found = False
-            for line in reversed(r.stdout.splitlines()):
-                if f"dpt:{public_port}" in line and ("REDIRECT" in line or "DNAT" in line):
-                    line_num = line.split()[0]
-                    subprocess.run(
-                        ["iptables", "-t", "nat", "-D", chain, line_num],
-                        capture_output=True, text=True, check=False,
-                    )
-                    found = True
-                    break  # restart scan since line numbers shifted
-            if not found:
-                break
+NGINX_CONF_DIR = "/etc/nginx/conf.d"
+NGINX_CONF_FILE = os.path.join(NGINX_CONF_DIR, "webarena-hotswap.conf")
+
+# Track current port mappings so we can write a single config file
+_port_mappings: dict[int, int] = {}  # public_port → target_port
+
+
+def _write_nginx_conf():
+    """Write nginx config and reload."""
+    blocks = []
+    for public_port, target_port in sorted(_port_mappings.items()):
+        blocks.append(f"""server {{
+    listen {public_port};
+    location / {{
+        proxy_pass http://127.0.0.1:{target_port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }}
+}}""")
+    conf = "\n\n".join(blocks) + "\n"
+    with open(NGINX_CONF_FILE, "w") as f:
+        f.write(conf)
+    subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=True)
 
 
 def set_redirect(public_port: int, target_port: int):
-    """Set iptables REDIRECT so traffic to `public_port` goes to `target_port`."""
-    _iptables_delete_rules(public_port)
+    """Update nginx to proxy `public_port` → `target_port` and reload."""
+    _port_mappings[public_port] = target_port
+    _write_nginx_conf()
+    logger.info("nginx: %d → %d", public_port, target_port)
 
-    # Insert at top of chain (before NETAVARK-HOSTPORT-DNAT) so our rules
-    # take priority over podman's own port forwarding.
-    # PREROUTING: external traffic
-    subprocess.run(
-        ["iptables", "-t", "nat", "-I", "PREROUTING", "1",
-         "-p", "tcp", "--dport", str(public_port),
-         "-j", "REDIRECT", "--to-port", str(target_port)],
-        check=True,
-    )
-    # OUTPUT: locally-generated traffic — use DNAT to 127.0.0.1:target_port
-    # (REDIRECT doesn't work reliably in OUTPUT for locally-generated packets)
-    subprocess.run(
-        ["iptables", "-t", "nat", "-I", "OUTPUT", "1",
-         "-p", "tcp", "--dport", str(public_port),
-         "-j", "DNAT", "--to-destination", f"127.0.0.1:{target_port}"],
-        check=True,
-    )
-    logger.info("iptables: %d → %d", public_port, target_port)
+
+def cleanup_nginx():
+    """Remove our nginx config and reload."""
+    if os.path.exists(NGINX_CONF_FILE):
+        os.remove(NGINX_CONF_FILE)
+        subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
+    _port_mappings.clear()
 
 # ---------------------------------------------------------------------------
 # ContainerManager — thin wrapper around podman
@@ -683,9 +675,7 @@ class HotSwapServer:
                 logger.info("Stopping %s...", cname)
                 cm.stop(cname)
                 cm.rm(cname)
-        # Clean up iptables rules
-        for name, pool in self.pools.items():
-            _iptables_delete_rules(pool.public_port)
+        cleanup_nginx()
         self._teardown_static_services()
         logger.info("=== Teardown complete ===")
 
