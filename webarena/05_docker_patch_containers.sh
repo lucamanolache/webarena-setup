@@ -46,5 +46,9 @@ podman exec shopping_admin /var/www/magento2/bin/magento cache:flush
 
 # gitlab
 podman exec gitlab sed -i "s|^external_url.*|external_url 'http://$PUBLIC_HOSTNAME:$GITLAB_PORT'|" /etc/gitlab/gitlab.rb
-podman exec gitlab bash -c "printf '\n\npuma[\"worker_processes\"] = 4' >> /etc/gitlab/gitlab.rb"  # bugfix https://github.com/ServiceNow/BrowserGym/issues/285
+podman exec gitlab bash -c "grep -q 'puma\[\"worker_processes\"\]' /etc/gitlab/gitlab.rb || printf '\npuma[\"worker_processes\"] = 4' >> /etc/gitlab/gitlab.rb"  # bugfix https://github.com/ServiceNow/BrowserGym/issues/285
+podman exec gitlab bash -c "grep -q 'prometheus_monitoring\[\"enable\"\]' /etc/gitlab/gitlab.rb || printf '\nprometheus_monitoring[\"enable\"] = false' >> /etc/gitlab/gitlab.rb"
 podman exec gitlab gitlab-ctl reconfigure
+
+# maps
+podman exec openstreetmap-website-web-1 bin/rails db:migrate RAILS_ENV=development
