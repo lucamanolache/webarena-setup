@@ -186,16 +186,18 @@ def set_redirect(public_port: int, target_port: int):
     """Set iptables REDIRECT so traffic to `public_port` goes to `target_port`."""
     _iptables_delete_rules(public_port)
 
+    # Insert at top of chain (before NETAVARK-HOSTPORT-DNAT) so our rules
+    # take priority over podman's own port forwarding.
     # PREROUTING: external traffic
     subprocess.run(
-        ["iptables", "-t", "nat", "-A", "PREROUTING",
+        ["iptables", "-t", "nat", "-I", "PREROUTING", "1",
          "-p", "tcp", "--dport", str(public_port),
          "-j", "REDIRECT", "--to-port", str(target_port)],
         check=True,
     )
     # OUTPUT: locally-generated traffic (health checks, curl from host, etc.)
     subprocess.run(
-        ["iptables", "-t", "nat", "-A", "OUTPUT",
+        ["iptables", "-t", "nat", "-I", "OUTPUT", "1",
          "-p", "tcp", "--dport", str(public_port),
          "-j", "REDIRECT", "--to-port", str(target_port)],
         check=True,
