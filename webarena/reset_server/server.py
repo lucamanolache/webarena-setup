@@ -193,10 +193,10 @@ def set_redirect(public_port: int, target_port: int):
          "-j", "REDIRECT", "--to-port", str(target_port)],
         check=True,
     )
-    # OUTPUT: localhost traffic (for health checks etc.)
+    # OUTPUT: locally-generated traffic (health checks, curl from host, etc.)
     subprocess.run(
         ["iptables", "-t", "nat", "-A", "OUTPUT",
-         "-p", "tcp", "-o", "lo", "--dport", str(public_port),
+         "-p", "tcp", "--dport", str(public_port),
          "-j", "REDIRECT", "--to-port", str(target_port)],
         check=True,
     )
