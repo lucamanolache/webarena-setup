@@ -744,7 +744,7 @@ def main():
     atexit.register(cleanup)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
-    httpd.allow_reuse_address = True
+    httpd.allow_reuse_address = False
     logger.info("Serving on port %d...", args.port)
     httpd.serve_forever()
 
