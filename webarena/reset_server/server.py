@@ -11,10 +11,12 @@ Usage:
 """
 
 import argparse
+import atexit
 import http.server
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -559,6 +561,20 @@ class HotSwapServer:
             "services": svc_status,
         }
 
+    def teardown(self):
+        """Stop and remove all managed containers."""
+        logger.info("=== Tearing down all containers ===")
+        for name, pool in self.pools.items():
+            for i in range(pool.pool_size):
+                cname = pool._container_name(i)
+                logger.info("Stopping %s...", cname)
+                cm.stop(cname)
+                cm.rm(cname)
+        # Clean up iptables rules
+        for name, pool in self.pools.items():
+            _iptables_delete_rules(pool.public_port)
+        logger.info("=== Teardown complete ===")
+
 
 # ---------------------------------------------------------------------------
 # HTTP handler
@@ -617,6 +633,18 @@ def main():
         server_instance.init()
     else:
         server_instance.resume()
+
+    # Ensure containers are cleaned up on exit (Ctrl+C, SIGTERM, etc.)
+    _torn_down = False
+
+    def cleanup(*_args):
+        nonlocal _torn_down
+        if not _torn_down:
+            _torn_down = True
+            server_instance.teardown()
+
+    signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
+    atexit.register(cleanup)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
     logger.info("Serving on port %d...", args.port)
