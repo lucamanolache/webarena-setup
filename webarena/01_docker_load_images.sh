@@ -18,7 +18,11 @@ load_docker_image() {
 
   if ! podman images --format "{{.Repository}}:{{.Tag}}" | grep -q "^${IMAGE_NAME}:"; then
     echo "Loading image ${IMAGE_NAME} from ${INPUT_FILE}"
-    podman load --input "${INPUT_FILE}"
+    if [[ "${INPUT_FILE}" == *.gz ]]; then
+      gunzip -c "${INPUT_FILE}" | podman load
+    else
+      podman load --input "${INPUT_FILE}"
+    fi
   else
     echo "Image ${IMAGE_NAME} is already loaded."
   fi
@@ -53,7 +57,12 @@ fi
 # extract openstreetmap archive locally (if needed)
 if [ ! -d ./openstreetmap-website ]; then
   echo "Extracting openstreetmap archive..."
-  tar -xzf ${ARCHIVES_LOCATION}/openstreetmap-website.tar.gz &
+  tar -xzf ${ARCHIVES_LOCATION}/openstreetmap-website.tar.gz
+  # the archive has newer Gemfile/Gemfile.lock than the docker image;
+  # overlay the image's versions so bundler matches pre-installed gems
+  echo "Syncing Gemfile with docker image..."
+  podman run --rm openstreetmap-website-web cat /app/Gemfile > ./openstreetmap-website/Gemfile
+  podman run --rm openstreetmap-website-web cat /app/Gemfile.lock > ./openstreetmap-website/Gemfile.lock
 else
   echo "Openstreetmap archive already extracted."
 fi

@@ -52,6 +52,7 @@ wait_for_container forum "curl -sf http://localhost"
 # kiwix-serve container has no curl, check from host
 wait_for_host_url wikipedia "http://localhost:${WIKIPEDIA_PORT}"
 wait_for_container openstreetmap-website-web-1 "curl -sf http://localhost:3000"
-# gitlab takes longer to boot
-wait_for_host_url gitlab "http://localhost:${GITLAB_PORT}" 120
+# gitlab takes longer to boot; before 05_patch it still listens on 8023 internally
+# use -o /dev/null -w '%{http_code}' since gitlab returns 302 redirect
+wait_for_container gitlab "curl -so /dev/null -w '%{http_code}' http://localhost:8023 | grep -q '^[23]'" 120
 echo "All services ready"
