@@ -55,7 +55,7 @@ SERVICES = {
         "public_port": 8082,
         "pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 60},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
     "shopping_admin": {
         "image": "shopping_admin:ready",
@@ -63,7 +63,7 @@ SERVICES = {
         "public_port": 8083,
         "pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 60},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
     "forum": {
         "image": "forum:ready",
@@ -71,7 +71,7 @@ SERVICES = {
         "public_port": 8080,
         "pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 60},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
     "gitlab": {
         "image": "gitlab:ready",
@@ -413,8 +413,16 @@ class ServicePool:
             self.instances[index] = "ready"
             logger.info("[%s] %s is ready", self.name, name)
         else:
-            self.instances[index] = "failed"
-            logger.error("[%s] %s failed health check", self.name, name)
+            # Retry once: restart the container and health-check again
+            logger.warning("[%s] %s failed health check, restarting and retrying...", self.name, name)
+            cm.stop(name)
+            cm.start(name)
+            if self._health_check(index):
+                self.instances[index] = "ready"
+                logger.info("[%s] %s is ready after retry", self.name, name)
+            else:
+                self.instances[index] = "failed"
+                logger.error("[%s] %s failed health check after retry", self.name, name)
 
     def get_next_ready(self) -> int | None:
         """Find the next ready instance (round-robin from current active)."""
@@ -493,8 +501,16 @@ class ServicePool:
             self.instances[index] = "ready"
             logger.info("[%s] %s rebuilt and ready", self.name, name)
         else:
-            self.instances[index] = "failed"
-            logger.error("[%s] %s failed health check after rebuild", self.name, name)
+            # Retry once: restart and health-check again
+            logger.warning("[%s] %s failed health check after rebuild, restarting...", self.name, name)
+            cm.stop(name)
+            cm.start(name)
+            if self._health_check(index):
+                self.instances[index] = "ready"
+                logger.info("[%s] %s ready after retry", self.name, name)
+            else:
+                self.instances[index] = "failed"
+                logger.error("[%s] %s failed health check after retry", self.name, name)
 
     def ready_count(self) -> int:
         return sum(1 for s in self.instances.values() if s == "ready")
