@@ -696,7 +696,8 @@ class HotSwapServer:
                      {n: p.active for n, p in self.pools.items()})
 
     def reset(self, services: list[str] | None = None) -> tuple[int, str]:
-        """Swap specified services (or all). Returns (http_status, message)."""
+        """Swap specified services (or all). All-or-nothing: only swaps if every
+        target service has a ready standby."""
         targets = services if services else list(self.pools.keys())
 
         # Validate service names
@@ -704,16 +705,26 @@ class HotSwapServer:
         if invalid:
             return 400, f"Unknown services: {', '.join(invalid)}"
 
-        errors = []
+        # Pre-check: ensure all targets have a ready standby before swapping any
+        not_ready = []
         for name in targets:
-            ok, msg = self.pools[name].swap()
-            if not ok:
-                errors.append(msg)
+            pool = self.pools[name]
+            if pool.get_next_ready() is None:
+                not_ready.append(name)
+                # Kick off retry/spawn so they'll be ready next time
+                with pool.lock:
+                    if not pool._retry_failed():
+                        pool._spawn_extra()
+
+        if not_ready:
+            self._save_state()
+            return 503, f"No ready standby for: {', '.join(not_ready)}"
+
+        # All services have standbys — commit the swap
+        for name in targets:
+            self.pools[name].swap()
 
         self._save_state()
-
-        if errors:
-            return 503, "; ".join(errors)
         return 200, "Reset complete"
 
     def status(self) -> dict:
