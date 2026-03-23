@@ -54,6 +54,7 @@ SERVICES = {
         "container_port": 80,
         "public_port": 8082,
         "pool_size": 2,
+        "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
@@ -62,6 +63,7 @@ SERVICES = {
         "container_port": 80,
         "public_port": 8083,
         "pool_size": 2,
+        "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
@@ -70,6 +72,7 @@ SERVICES = {
         "container_port": 80,
         "public_port": 8080,
         "pool_size": 2,
+        "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
     },
@@ -78,6 +81,7 @@ SERVICES = {
         "container_port": 9001,
         "public_port": 9001,
         "pool_size": 5,
+        "max_pool_size": 6,
         "create_args": [],
         "create_cmd": ["/opt/gitlab/embedded/bin/runsvdir-start"],
         "create_env": {"GITLAB_PORT": "9001"},
@@ -92,6 +96,7 @@ SERVICES = {
         "container_port": 80,
         "public_port": 8081,
         "pool_size": 2,
+        "max_pool_size": 2,
         "create_args": [],
         "create_cmd": ["wikipedia_en_all_maxi_2022-05.zim"],
         "create_volumes": {f"{WORKING_DIR}/wiki/": "/data"},
@@ -308,12 +313,16 @@ class ServicePool:
         self.name = service_name
         self.config = config
         self.pool_size = config["pool_size"]
+        self.max_pool_size = config.get("max_pool_size", self.pool_size)
         self.public_port = config["public_port"]
         self.lock = threading.Lock()
 
         if state:
             self.active = state["active"]
             self.instances = {int(k): v for k, v in state["instances"].items()}
+            # Restore pool_size from state (may have grown beyond initial)
+            if self.instances:
+                self.pool_size = max(self.pool_size, max(self.instances.keys()) + 1)
         else:
             self.active = 0
             self.instances = {i: "pending" for i in range(self.pool_size)}
@@ -430,30 +439,52 @@ class ServicePool:
         return None
 
     def _spawn_extra(self):
-        """Add a new instance to the pool in the background."""
+        """Add a new instance to the pool in the background, respecting max_pool_size."""
+        if self.pool_size >= self.max_pool_size:
+            logger.warning("[%s] Pool at max size (%d), not spawning extra",
+                           self.name, self.max_pool_size)
+            # Try to retry a failed instance instead
+            self._retry_failed()
+            return
         new_idx = self.pool_size
         self.pool_size += 1
         self.instances[new_idx] = "rebuilding"
-        logger.info("[%s] Spawning extra instance %d (pool now %d)",
-                    self.name, new_idx, self.pool_size)
+        logger.info("[%s] Spawning extra instance %d (pool now %d, max %d)",
+                    self.name, new_idx, self.pool_size, self.max_pool_size)
         t = threading.Thread(
             target=self._rebuild, args=(new_idx,),
             name=f"spawn-{self.name}-{new_idx}", daemon=True,
         )
         t.start()
 
+    def _retry_failed(self):
+        """Retry the first failed instance in the background."""
+        for idx, state in self.instances.items():
+            if state == "failed":
+                self.instances[idx] = "rebuilding"
+                logger.info("[%s] Retrying failed instance %d", self.name, idx)
+                t = threading.Thread(
+                    target=self._rebuild, args=(idx,),
+                    name=f"retry-{self.name}-{idx}", daemon=True,
+                )
+                t.start()
+                return True
+        return False
+
     def swap(self) -> tuple[bool, str]:
         """Swap to next ready instance. Returns (success, message)."""
         with self.lock:
             next_idx = self.get_next_ready()
             if next_idx is None:
-                # No standby ready — spawn an extra instance for next time
-                self._spawn_extra()
-                return False, f"No ready standby for: {self.name} (spawning extra)"
+                # No standby ready — try retrying a failed instance first,
+                # then spawn extra only if under max_pool_size
+                if not self._retry_failed():
+                    self._spawn_extra()
+                return False, f"No ready standby for: {self.name}"
 
             old_idx = self.active
 
-            # Swap iptables
+            # Swap nginx
             set_redirect(self.public_port, self._host_port(next_idx))
 
             # Update state
@@ -463,7 +494,8 @@ class ServicePool:
 
             # If no more standbys after this swap, grow the pool
             if self.ready_count() == 0:
-                self._spawn_extra()
+                if not self._retry_failed():
+                    self._spawn_extra()
 
             logger.info("[%s] Swapped %d → %d", self.name, old_idx, next_idx)
 
@@ -512,11 +544,34 @@ class ServicePool:
     def ready_count(self) -> int:
         return sum(1 for s in self.instances.values() if s == "ready")
 
+    def shrink_to_max(self):
+        """Remove failed instances beyond max_pool_size."""
+        removed = []
+        with self.lock:
+            # Collect indices to remove: failed instances with index >= max_pool_size
+            to_remove = sorted(
+                idx for idx, state in self.instances.items()
+                if state == "failed" and idx >= self.config["pool_size"]
+            )
+            while self.pool_size > self.max_pool_size and to_remove:
+                idx = to_remove.pop()
+                name = self._container_name(idx)
+                cm.stop(name)
+                cm.rm(name)
+                del self.instances[idx]
+                removed.append(idx)
+                self.pool_size -= 1
+        if removed:
+            logger.info("[%s] Shrunk pool: removed instances %s (pool now %d)",
+                        self.name, removed, self.pool_size)
+        return removed
+
     def status_dict(self) -> dict:
         return {
             "active": self.active,
             "ready_count": self.ready_count(),
             "total": self.pool_size,
+            "max_pool_size": self.max_pool_size,
             "instances": dict(self.instances),
         }
 
@@ -707,8 +762,25 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/status":
             self._respond(200, server_instance.status())
 
+        elif path == "/shrink":
+            result = {}
+            for name, pool in server_instance.pools.items():
+                removed = pool.shrink_to_max()
+                if removed:
+                    result[name] = f"removed instances {removed}"
+            server_instance._save_state()
+            self._respond(200, {"message": "Shrink complete", "result": result})
+
+        elif path == "/retry":
+            result = {}
+            for name, pool in server_instance.pools.items():
+                if pool._retry_failed():
+                    result[name] = "retrying a failed instance"
+            server_instance._save_state()
+            self._respond(200, {"message": "Retry triggered", "result": result})
+
         else:
-            self._respond(404, {"message": "Not found. Use /reset or /status"})
+            self._respond(404, {"message": "Not found. Use /reset, /status, /shrink, or /retry"})
 
     def _respond(self, code: int, body: dict):
         self.send_response(code)
