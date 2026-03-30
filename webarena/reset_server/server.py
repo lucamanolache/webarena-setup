@@ -607,6 +607,21 @@ class HotSwapServer:
                 json.dump(state, f, indent=2)
             os.replace(tmp, self.state_file)
 
+    def _ensure_nginx(self):
+        """Ensure nginx is running with a clean hotswap config."""
+        # Write empty config so nginx doesn't try to bind stale ports
+        with open(NGINX_CONF_FILE, "w") as f:
+            f.write("# managed by server.py\n")
+        # Start nginx if not running, or reload to pick up clean config
+        r = subprocess.run(["nginx", "-t"], capture_output=True, check=False)
+        if r.returncode != 0:
+            logger.error("nginx config test failed: %s", r.stderr)
+            return
+        subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
+        # If reload fails (not running), start it
+        subprocess.run(["nginx"], capture_output=True, check=False)
+        logger.info("nginx is ready")
+
     def _init_static_services(self):
         """Start static (non-resettable) services."""
         # Ensure podman network exists for OSM
@@ -660,7 +675,8 @@ class HotSwapServer:
                 cm.rm(name)
 
     def init(self):
-        """First-time setup: create all pool instances and configure iptables."""
+        """First-time setup: create all pool instances and configure nginx."""
+        self._ensure_nginx()
         self._init_static_services()
         logger.info("=== Initializing all service pools in parallel ===")
         threads = []
@@ -676,7 +692,8 @@ class HotSwapServer:
         logger.info("=== Initialization complete ===")
 
     def resume(self):
-        """Resume from persisted state. Re-establish iptables rules."""
+        """Resume from persisted state. Re-establish nginx rules."""
+        self._ensure_nginx()
         self._init_static_services()
 
         saved = self._load_state()
