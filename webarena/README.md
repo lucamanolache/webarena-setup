@@ -6,8 +6,13 @@ Setup scripts and hot-swap reset server for WebArena.
 
 ## Prerequisites
 
-- Debian 12 server with podman and nginx installed
+- Debian 12 server
 - Required archive files (see [Get the files](#get-the-files))
+
+Install dependencies:
+```bash
+sudo bash 00_install_deps.sh
+```
 
 ## Get the files
 
@@ -29,45 +34,45 @@ wget https://zenodo.org/records/12636845/files/openstreetmap-website.tar.gz
 
 Edit `00_vars.sh` with your hostname/IP and ports. Set `ARCHIVES_LOCATION` to where you placed the downloaded files.
 
-## Initial setup (one-time)
+## Quick start
+
+First-time setup + run everything:
+```bash
+sudo bash run_all.sh --setup
+```
+
+Subsequent runs (`:ready` images already exist):
+```bash
+sudo bash run_all.sh
+```
+
+This starts the homepage server and the reset server, which manages all containers.
+
+## Step-by-step setup
+
+If you prefer to run things individually:
 
 ```bash
-# Load images into podman
+# 1. Load images into podman
 sudo bash 01_docker_load_images.sh
 
-# Create and start containers
+# 2. Create, start, and patch containers
 sudo bash 02_docker_remove_containers.sh
 sudo bash 03_docker_create_containers.sh
 sudo bash 04_docker_start_containers.sh
-
-# Patch containers (configure URLs, etc.)
 sudo bash 05_docker_patch_containers.sh
 
-# Commit patched containers as :ready images (used by the pool)
+# 3. Commit patched containers as :ready images (used by the pool)
 sudo bash 08_checkpoint.sh
 
-# Start homepage server (port 80)
-sudo bash 06_serve_homepage.sh
-```
+# 4. Start homepage server (port 80)
+sudo bash 06_serve_homepage.sh &
 
-## Install nginx
-
-The reset server uses nginx as a reverse proxy to route public ports to pool containers.
-
-```bash
-sudo apt install nginx
-sudo rm /etc/nginx/sites-enabled/default   # free port 80 for homepage
-sudo systemctl enable nginx
-sudo systemctl start nginx
-```
-
-## Start the reset server
-
-```bash
+# 5. Start reset server (manages all containers)
 sudo bash 07_serve_reset.sh
 ```
 
-This runs `server.py --port 7565 --init` which:
+The reset server (`07_serve_reset.sh`) runs `server.py --port 7565 --init` which:
 1. Starts static services (OpenStreetMap)
 2. Creates a pool of container instances per service
 3. Health-checks all instances in parallel
