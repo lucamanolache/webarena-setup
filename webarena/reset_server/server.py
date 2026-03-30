@@ -46,7 +46,9 @@ logger.addHandler(handler)
 #   - type "exec": run a command inside the container
 #   - type "http": curl a URL from the host
 
-WORKING_DIR = os.environ.get("WEBARENA_WORKING_DIR", "/home/luca/webarena-setup/webarena")
+# Auto-detect: reset_server/ is inside webarena/, so go up one level
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKING_DIR = os.environ.get("WEBARENA_WORKING_DIR", os.path.dirname(_SCRIPT_DIR))
 
 SERVICES = {
     "shopping": {

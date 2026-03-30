@@ -181,7 +181,7 @@ ssh -L 8082:localhost:8082 \
     -L 8081:localhost:8081 \
     -L 9001:localhost:9001 \
     -L 8443:localhost:443 \
-    luca@34.72.36.164
+    user@YOUR_SERVER_IP
 ```
 
 Then open in your browser:
