@@ -58,7 +58,7 @@ SERVICES = {
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
     },
     "shopping_admin": {
         "image": "shopping_admin:ready",
@@ -67,7 +67,7 @@ SERVICES = {
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
     },
     "forum": {
         "image": "forum:ready",
@@ -76,7 +76,7 @@ SERVICES = {
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
-        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 180},
+        "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
     },
     "gitlab": {
         "image": "gitlab:ready",
