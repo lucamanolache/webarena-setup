@@ -370,7 +370,7 @@ class ServicePool:
         return False
 
     def init_all(self):
-        """Create, start, and health-check all instances. Set up iptables for active."""
+        """Create, start, and health-check all instances one at a time."""
         logger.info("[%s] Initializing %d instances...", self.name, self.pool_size)
         for i in range(self.pool_size):
             name = self._container_name(i)
@@ -384,18 +384,8 @@ class ServicePool:
             if not cm.start(name):
                 self.instances[i] = "failed"
                 continue
-            self.instances[i] = "starting"
-
-        # Health-check all in parallel
-        threads = []
-        for i in range(self.pool_size):
-            if self.instances[i] == "failed":
-                continue
-            t = threading.Thread(target=self._init_health_check, args=(i,), name=f"hc-{self.name}-{i}")
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
+            # Health-check before starting next instance
+            self._init_health_check(i)
 
         # Set up iptables for active instance
         if self.instances.get(self.active) == "ready":
