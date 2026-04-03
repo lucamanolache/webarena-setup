@@ -689,16 +689,11 @@ class HotSwapServer:
         """First-time setup: create all pool instances and configure nginx."""
         self._ensure_nginx()
         self._init_static_services()
-        logger.info("=== Initializing all service pools in parallel ===")
-        threads = []
+        logger.info("=== Initializing service pools sequentially ===")
         for name, config in self.services_config.items():
             pool = ServicePool(name, config)
             self.pools[name] = pool
-            t = threading.Thread(target=pool.init_all, name=f"init-{name}")
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
+            pool.init_all()
         self._save_state()
         logger.info("=== Initialization complete ===")
 
