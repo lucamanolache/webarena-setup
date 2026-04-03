@@ -868,7 +868,7 @@ def main():
     signal.signal(signal.SIGHUP, signal.SIG_IGN)  # ignore SSH disconnect
     atexit.register(cleanup)
 
-    # Kill any old server on this port before binding
+    # Kill any old server on this port and wait for it to release
     r = subprocess.run(["ss", "-tlnp", f"sport = :{args.port}"],
                        capture_output=True, text=True, check=False)
     for line in r.stdout.splitlines():
@@ -880,7 +880,17 @@ def main():
                 if old_pid != os.getpid():
                     logger.warning("Killing old server on port %d (pid %d)", args.port, old_pid)
                     os.kill(old_pid, signal.SIGTERM)
-                    time.sleep(2)
+                    # Wait for port to be released
+                    for _ in range(30):
+                        time.sleep(1)
+                        r2 = subprocess.run(["ss", "-tlnp", f"sport = :{args.port}"],
+                                            capture_output=True, text=True, check=False)
+                        if f":{args.port}" not in r2.stdout:
+                            break
+                    else:
+                        logger.warning("Force-killing old server (pid %d)", old_pid)
+                        os.kill(old_pid, signal.SIGKILL)
+                        time.sleep(2)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
     logger.info("Serving on port %d...", args.port)
