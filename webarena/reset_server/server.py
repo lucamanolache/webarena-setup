@@ -868,8 +868,21 @@ def main():
     signal.signal(signal.SIGHUP, signal.SIG_IGN)  # ignore SSH disconnect
     atexit.register(cleanup)
 
+    # Kill any old server on this port before binding
+    r = subprocess.run(["ss", "-tlnp", f"sport = :{args.port}"],
+                       capture_output=True, text=True, check=False)
+    for line in r.stdout.splitlines():
+        if f":{args.port}" in line:
+            import re
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                old_pid = int(m.group(1))
+                if old_pid != os.getpid():
+                    logger.warning("Killing old server on port %d (pid %d)", args.port, old_pid)
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(2)
+
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
-    httpd.allow_reuse_address = False
     logger.info("Serving on port %d...", args.port)
     httpd.serve_forever()
 
