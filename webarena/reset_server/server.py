@@ -865,6 +865,7 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
     signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)  # ignore SSH disconnect
     atexit.register(cleanup)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
