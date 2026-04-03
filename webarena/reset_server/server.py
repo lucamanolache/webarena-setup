@@ -460,18 +460,29 @@ class ServicePool:
         t.start()
 
     def _retry_failed(self):
-        """Retry the first failed instance in the background."""
+        """Retry the first failed instance: health-check first, rebuild only if needed."""
         for idx, state in self.instances.items():
             if state == "failed":
                 self.instances[idx] = "rebuilding"
                 logger.info("[%s] Retrying failed instance %d", self.name, idx)
                 t = threading.Thread(
-                    target=self._rebuild, args=(idx,),
+                    target=self._retry_or_rebuild, args=(idx,),
                     name=f"retry-{self.name}-{idx}", daemon=True,
                 )
                 t.start()
                 return True
         return False
+
+    def _retry_or_rebuild(self, index: int):
+        """Check if a failed instance is actually healthy; rebuild only if not."""
+        name = self._container_name(index)
+        # Try health-checking the existing container first
+        if cm.exists(name) and self._health_check(index):
+            self.instances[index] = "ready"
+            logger.info("[%s] %s is already healthy, marked ready", self.name, name)
+            return
+        # Not healthy — full rebuild
+        self._rebuild(index)
 
     def swap(self) -> tuple[bool, str]:
         """Swap to next ready instance. Returns (success, message)."""
