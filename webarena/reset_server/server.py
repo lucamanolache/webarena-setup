@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -55,6 +56,8 @@ SERVICES = {
         "image": "shopping:ready",
         "container_port": 80,
         "public_port": 8082,
+        "port_base": 18280,
+        "port_range_size": 16,
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
@@ -64,6 +67,8 @@ SERVICES = {
         "image": "shopping_admin:ready",
         "container_port": 80,
         "public_port": 8083,
+        "port_base": 18380,
+        "port_range_size": 16,
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
@@ -73,6 +78,8 @@ SERVICES = {
         "image": "forum:ready",
         "container_port": 80,
         "public_port": 8080,
+        "port_base": 18080,
+        "port_range_size": 16,
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
@@ -82,6 +89,8 @@ SERVICES = {
         "image": "gitlab:ready",
         "container_port": 9001,
         "public_port": 9001,
+        "port_base": 19001,
+        "port_range_size": 16,
         "pool_size": 5,
         "max_pool_size": 6,
         "create_args": [],
@@ -97,6 +106,8 @@ SERVICES = {
         "image": "wikipedia:ready",
         "container_port": 80,
         "public_port": 8081,
+        "port_base": 18180,
+        "port_range_size": 16,
         "pool_size": 2,
         "max_pool_size": 2,
         "create_args": [],
@@ -141,14 +152,70 @@ STATIC_SERVICES = {
 }
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "pool_state.json")
+MAX_TCP_PORT = 65535
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def host_port(public_port: int, index: int) -> int:
-    """Compute the unique host port for a service instance."""
-    return public_port + (index + 1) * 10000
+def preferred_host_port(config: dict, index: int) -> int:
+    """Compute the preferred host port for a service instance."""
+    return config["port_base"] + index
+
+
+def port_range(config: dict) -> range:
+    return range(config["port_base"], config["port_base"] + config["port_range_size"])
+
+
+def is_port_free(port: int) -> bool:
+    """Best-effort local port availability check."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def is_port_conflict_error(error_text: str | None) -> bool:
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+    return (
+        "address already in use" in lowered
+        or "port is already allocated" in lowered
+        or ("bind" in lowered and "use" in lowered)
+    )
+
+
+def validate_services_config():
+    """Fail fast if configured service port ranges are invalid or overlap."""
+    reserved_ports = {7565}
+    reserved_ports.update(config["public_port"] for config in SERVICES.values())
+    for containers in STATIC_SERVICES.values():
+        for spec in containers:
+            host_port = int(spec["port_mapping"].split(":", 1)[0])
+            reserved_ports.add(host_port)
+    claimed_ports: dict[int, str] = {}
+
+    for service_name, config in SERVICES.items():
+        max_instances = config.get("max_pool_size", config["pool_size"])
+        range_size = config["port_range_size"]
+        if range_size < max_instances:
+            raise ValueError(
+                f"{service_name}: port_range_size={range_size} is smaller than "
+                f"max_pool_size={max_instances}"
+            )
+        for port in port_range(config):
+            if port > MAX_TCP_PORT:
+                raise ValueError(f"{service_name}: host port {port} exceeds {MAX_TCP_PORT}")
+            if port in reserved_ports:
+                raise ValueError(f"{service_name}: host port {port} conflicts with a reserved port")
+            owner = claimed_ports.get(port)
+            if owner:
+                raise ValueError(f"{service_name}: host port {port} overlaps with {owner}")
+            claimed_ports[port] = service_name
 
 
 def container_name(service: str, index: int) -> str:
@@ -159,6 +226,9 @@ def run(cmd: list[str], check: bool = True, timeout: int = 30) -> subprocess.Com
     """Run a command, log it, return result."""
     logger.debug("$ %s", " ".join(cmd))
     return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+validate_services_config()
 
 # ---------------------------------------------------------------------------
 # nginx reverse-proxy management
@@ -224,7 +294,7 @@ class ContainerManager:
                extra_args: list[str] | None = None,
                cmd: list[str] | None = None,
                env: dict[str, str] | None = None,
-               volumes: dict[str, str] | None = None) -> bool:
+               volumes: dict[str, str] | None = None) -> tuple[bool, str | None]:
         args = ["podman", "create", "--name", name, "-p", port_mapping]
         if env:
             for k, v in env.items():
@@ -240,10 +310,13 @@ class ContainerManager:
         try:
             run(args, timeout=60)
             logger.info("Created container %s", name)
-            return True
+            return True, None
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.error("Failed to create %s: %s", name, e)
-            return False
+            stderr = getattr(e, "stderr", None)
+            stdout = getattr(e, "stdout", None)
+            details = stderr or stdout or str(e)
+            logger.error("Failed to create %s: %s", name, details)
+            return False, details
 
     def start(self, name: str) -> bool:
         try:
@@ -268,6 +341,20 @@ class ContainerManager:
             return True
         except subprocess.TimeoutExpired:
             return False
+
+    def get_host_port(self, name: str, container_port: int) -> int | None:
+        try:
+            result = run(["podman", "port", name, str(container_port)], timeout=15)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return None
+        last_field = output.split()[-1]
+        try:
+            return int(last_field.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
 
     def health_check_exec(self, name: str, cmd: str, timeout: int = 60) -> bool:
         """Poll `podman exec <name> sh -c <cmd>` until success or timeout."""
@@ -317,46 +404,93 @@ class ServicePool:
         self.pool_size = config["pool_size"]
         self.max_pool_size = config.get("max_pool_size", self.pool_size)
         self.public_port = config["public_port"]
+        self.port_base = config["port_base"]
+        self.port_range_size = config["port_range_size"]
         self.lock = threading.Lock()
 
         if state:
             self.active = state["active"]
             self.instances = {int(k): v for k, v in state["instances"].items()}
+            saved_ports = state.get("ports", {})
+            self.ports = {int(k): int(v) for k, v in saved_ports.items()}
             # Restore pool_size from state (may have grown beyond initial)
             if self.instances:
                 self.pool_size = max(self.pool_size, max(self.instances.keys()) + 1)
         else:
             self.active = 0
             self.instances = {i: "pending" for i in range(self.pool_size)}
+            self.ports = {}
+
+        self._hydrate_ports_from_runtime()
 
     def state_dict(self) -> dict:
         return {
             "active": self.active,
             "instances": {str(k): v for k, v in self.instances.items()},
+            "ports": {str(k): v for k, v in self.ports.items()},
         }
 
+    def _hydrate_ports_from_runtime(self):
+        """Keep persisted port assignments aligned with running containers."""
+        for index in self.instances:
+            if index in self.ports:
+                continue
+            host_port = cm.get_host_port(self._container_name(index), self.config["container_port"])
+            if host_port is not None:
+                self.ports[index] = host_port
+
+    def _preferred_host_port(self, index: int) -> int:
+        return preferred_host_port(self.config, index)
+
     def _host_port(self, index: int) -> int:
-        return host_port(self.public_port, index)
+        return self.ports.get(index, self._preferred_host_port(index))
 
     def _container_name(self, index: int) -> str:
         return container_name(self.name, index)
 
-    def _port_mapping(self, index: int) -> str:
-        hp = self._host_port(index)
+    def _port_mapping(self, host_port: int) -> str:
         cp = self.config["container_port"]
-        return f"{hp}:{cp}"
+        return f"{host_port}:{cp}"
+
+    def _candidate_ports(self, index: int) -> list[int]:
+        preferred = self._host_port(index)
+        in_use_by_service = {
+            port for idx, port in self.ports.items()
+            if idx != index and idx in self.instances
+        }
+        candidates = []
+        if preferred in port_range(self.config) and preferred not in in_use_by_service:
+            candidates.append(preferred)
+        for port in port_range(self.config):
+            if port == preferred or port in in_use_by_service:
+                continue
+            candidates.append(port)
+        return candidates
 
     def _create_instance(self, index: int) -> bool:
         name = self._container_name(index)
-        return cm.create(
-            name=name,
-            image=self.config["image"],
-            port_mapping=self._port_mapping(index),
-            extra_args=self.config.get("create_args"),
-            cmd=self.config.get("create_cmd"),
-            env=self.config.get("create_env"),
-            volumes=self.config.get("create_volumes"),
-        )
+        for host_port in self._candidate_ports(index):
+            if not is_port_free(host_port):
+                continue
+            ok, error_text = cm.create(
+                name=name,
+                image=self.config["image"],
+                port_mapping=self._port_mapping(host_port),
+                extra_args=self.config.get("create_args"),
+                cmd=self.config.get("create_cmd"),
+                env=self.config.get("create_env"),
+                volumes=self.config.get("create_volumes"),
+            )
+            if ok:
+                self.ports[index] = host_port
+                return True
+            if not is_port_conflict_error(error_text):
+                return False
+
+        logger.error("[%s] No free host ports available in reserved range %d-%d",
+                     self.name, self.port_base, self.port_base + self.port_range_size - 1)
+        self.ports.pop(index, None)
+        return False
 
     def _health_check(self, index: int) -> bool:
         hc = self.config["health_check"]
@@ -562,6 +696,7 @@ class ServicePool:
                 cm.stop(name)
                 cm.rm(name)
                 del self.instances[idx]
+                self.ports.pop(idx, None)
                 removed.append(idx)
                 self.pool_size -= 1
         if removed:
@@ -576,6 +711,7 @@ class ServicePool:
             "total": self.pool_size,
             "max_pool_size": self.max_pool_size,
             "instances": dict(self.instances),
+            "ports": dict(self.ports),
         }
 
 
@@ -634,7 +770,7 @@ class HotSwapServer:
                 name = spec["name"]
                 cm.stop(name)
                 cm.rm(name)
-                ok = cm.create(
+                ok, _ = cm.create(
                     name=name,
                     image=spec["image"],
                     port_mapping=spec["port_mapping"],
@@ -702,7 +838,7 @@ class HotSwapServer:
             pool = ServicePool(name, config, state=state)
             # Re-establish iptables for the active instance
             active = pool.active
-            if pool.instances.get(active) in ("active", "ready"):
+            if pool.instances.get(active) in ("active", "ready") and cm.exists(pool._container_name(active)):
                 set_redirect(pool.public_port, pool._host_port(active))
                 pool.instances[active] = "active"
             self.pools[name] = pool

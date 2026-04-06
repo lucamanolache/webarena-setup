@@ -96,7 +96,7 @@ Each service maintains multiple container instances. One is **active** (serving 
 | wikipedia | 8081 | 2 | ~10 sec |
 | openstreetmap | 443 | 1 (static) | ~30 sec |
 
-Each instance gets a unique host port: `public_port + (index + 1) * 10000`. For example, `shopping_0` listens on 18082, `shopping_1` on 28082.
+Each service has a reserved internal host-port range. Instances prefer `port_base + index`, and if that port is busy the server picks the next free port inside that service's reserved range and stores it in `pool_state.json`. For example, shopping uses the `18280+` range and gitlab uses the `19001+` range.
 
 ### Reset flow (~0.05s)
 
