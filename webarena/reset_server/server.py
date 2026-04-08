@@ -102,24 +102,21 @@ SERVICES = {
             "timeout": 360,
         },
     },
-    "wikipedia": {
-        "image": "wikipedia:ready",
-        "container_port": 80,
-        "public_port": 8081,
-        "port_base": 18180,
-        "port_range_size": 16,
-        "pool_size": 2,
-        "max_pool_size": 2,
-        "create_args": [],
-        "create_cmd": ["wikipedia_en_all_maxi_2022-05.zim"],
-        "create_volumes": {f"{WORKING_DIR}/wiki/": "/data"},
-        "health_check": {"type": "http", "url_template": "http://localhost:{host_port}", "timeout": 60},
-    },
 }
 
 # Static services: started once, never reset or pooled.
 # Each entry is a list of containers that are started together.
 STATIC_SERVICES = {
+    "wikipedia": [
+        {
+            "name": "wikipedia",
+            "image": "ghcr.io/kiwix/kiwix-serve:3.3.0",
+            "port_mapping": "8081:80",
+            "volumes": {f"{WORKING_DIR}/wiki/": "/data"},
+            "cmd": ["wikipedia_en_all_maxi_2022-05.zim"],
+            "health_check": {"type": "http", "url": "http://localhost:8081", "timeout": 60},
+        },
+    ],
     "openstreetmap": [
         {
             "name": "openstreetmap-website-db-1",
@@ -811,8 +808,18 @@ class HotSwapServer:
                 cm.stop(name)
                 cm.rm(name)
 
+    def _kill_all_containers(self):
+        """Stop and remove all podman containers before starting fresh."""
+        logger.info("=== Killing all existing podman containers ===")
+        subprocess.run(["podman", "stop", "-a", "-t", "10"],
+                       capture_output=True, check=False, timeout=120)
+        subprocess.run(["podman", "rm", "-a", "-f"],
+                       capture_output=True, check=False, timeout=60)
+        logger.info("All containers removed")
+
     def init(self):
         """First-time setup: create all pool instances and configure nginx."""
+        self._kill_all_containers()
         self._ensure_nginx()
         self._init_static_services()
         logger.info("=== Initializing service pools sequentially ===")
