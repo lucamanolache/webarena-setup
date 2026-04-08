@@ -746,13 +746,12 @@ class HotSwapServer:
         # Write empty config so nginx doesn't try to bind stale ports
         with open(NGINX_CONF_FILE, "w") as f:
             f.write("# managed by server.py\n")
-        # Start nginx if not running, or reload to pick up clean config
         r = subprocess.run(["nginx", "-t"], capture_output=True, check=False)
         if r.returncode != 0:
             logger.error("nginx config test failed: %s", r.stderr)
             return
-        # Full stop+start (not reload) to ensure old port bindings are released
-        subprocess.run(["nginx", "-s", "stop"], capture_output=True, check=False)
+        # Kill all nginx processes to guarantee old port bindings are released
+        subprocess.run(["pkill", "-9", "nginx"], capture_output=True, check=False)
         time.sleep(1)
         subprocess.run(["nginx"], capture_output=True, check=False)
         logger.info("nginx is ready")
