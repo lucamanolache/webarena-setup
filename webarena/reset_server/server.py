@@ -751,8 +751,9 @@ class HotSwapServer:
         if r.returncode != 0:
             logger.error("nginx config test failed: %s", r.stderr)
             return
-        subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
-        # If reload fails (not running), start it
+        # Full stop+start (not reload) to ensure old port bindings are released
+        subprocess.run(["nginx", "-s", "stop"], capture_output=True, check=False)
+        time.sleep(1)
         subprocess.run(["nginx"], capture_output=True, check=False)
         logger.info("nginx is ready")
 
