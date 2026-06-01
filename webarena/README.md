@@ -73,10 +73,10 @@ sudo bash 07_serve_reset.sh
 ```
 
 The reset server (`07_serve_reset.sh`) runs `server.py --port 7565 --init` which:
-1. Starts static services (OpenStreetMap)
-2. Creates a pool of container instances per service
-3. Health-checks all instances in parallel
-4. Writes nginx config to route public ports to active instances
+1. Starts static services (OpenStreetMap, Wikipedia)
+2. Boots one **active** container per service (standbys warm later, on demand)
+3. Writes nginx config to route public ports to active instances
+4. Starts a background warmer that warms standbys for used services and shrinks idle ones
 5. Starts the HTTP API on port 7565
 
 On Ctrl+C or SIGTERM, the server tears down all containers and cleans up nginx.
@@ -85,30 +85,52 @@ On Ctrl+C or SIGTERM, the server tears down all containers and cleans up nginx.
 
 ### Container pool
 
-Each service maintains multiple container instances. One is **active** (serving traffic), the rest are **ready** (standby) or **rebuilding**.
+Each service maintains a pool of container instances. One is **active** (serving traffic), the rest are **ready** (standby) or **rebuilding**.
 
-| Service | Public port | Pool size | Boot time |
-|---------|------------|-----------|-----------|
-| shopping | 8082 | 2 | ~2 min |
-| shopping_admin | 8083 | 2 | ~2 min |
-| forum | 8080 | 2 | ~1 min |
-| gitlab | 9001 | 5 | ~4 min |
-| wikipedia | 8081 | 2 | ~10 sec |
-| openstreetmap | 443 | 1 (static) | ~30 sec |
+| Service | Public port | Warm target | Min (idle) | Max | Boot time |
+|---------|------------|-------------|-----------|-----|-----------|
+| shopping | 8082 | 2 | 1 | 2 | ~2 min |
+| shopping_admin | 8083 | 2 | 1 | 2 | ~2 min |
+| forum | 8080 | 2 | 1 | 2 | ~1 min |
+| gitlab | 9001 | 5 | 1 | 6 | ~4 min |
+| wikipedia | 8081 | — (static) | — | — | ~10 sec |
+| openstreetmap | 443 | — (static) | — | — | ~30 sec |
 
 Each service has a reserved internal host-port range. Instances prefer `port_base + index`, and if that port is busy the server picks the next free port inside that service's reserved range and stores it in `pool_state.json`. For example, shopping uses the `18280+` range and gitlab uses the `19001+` range.
 
+### Usage-based sizing (don't waste resources)
+
+The pool size adapts to usage so idle arenas don't burn resources:
+
+- **`--init` boots only the active container per service**, so the stack starts serving quickly instead of waiting for every standby to boot.
+- A service warms standbys up to its **warm target** only *after it is reset* (i.e. actually used).
+- A service with no reset for `WEBARENA_IDLE_TIMEOUT` seconds (default 30 min) is considered **idle** and is shrunk back to **min** (just the active container).
+- A background **warmer** thread reconciles each pool toward its desired size every `WEBARENA_WARMER_INTERVAL` seconds (default 15s): it warms standbys for used services, shrinks idle ones, retries failed instances, and self-heals a dead active container.
+
+Both knobs are environment variables read at startup.
+
+### One podman boot at a time (robustness)
+
+Launching many containers concurrently is the main source of flaky podman
+failures. Every container **boot** (`podman create` + `start`) is serialized
+process-wide by a single global lock, so no matter how many resets arrive at
+once, only one container is created/started at a time. Health checks run
+*outside* the lock, so multiple services still warm concurrently — serialization
+adds robustness without serializing the slow part. `podman create`/`start` also
+retry transient failures (e.g. "database is locked") with backoff.
+
 ### Reset flow (~0.05s)
 
-1. Find next ready standby (round-robin)
-2. Update nginx config to point public port at new instance
-3. `nginx -s reload`
-4. Mark old instance as rebuilding, start background rebuild
-5. If no standbys remain, auto-spawn an extra instance
+1. Mark the targeted service(s) as used (so the warmer keeps them warm).
+2. Find next ready standby (round-robin).
+3. Update nginx config to point the public port at the new instance and reload.
+4. Mark old instance as rebuilding; rebuild it in the background (serialized via the boot lock).
+
+If a target has no ready standby (e.g. its first reset after being idle), the reset returns `503` and the warmer brings a standby up for next time.
 
 ### Static services
 
-OpenStreetMap (db + web) is started once and never reset. It is managed by the server (started on init, stopped on teardown) but excluded from the pool/reset cycle.
+OpenStreetMap (db + web) and Wikipedia are started once and never reset. They are managed by the server (started on init, stopped on teardown) but excluded from the pool/reset cycle.
 
 ## API
 
@@ -133,16 +155,27 @@ GET http://localhost:7565/status
 Returns:
 ```json
 {
-  "status": "ready",
+  "status": "serving",
   "services": {
-    "shopping": {"active": 0, "ready_count": 1, "total": 2},
-    "gitlab": {"active": 2, "ready_count": 3, "total": 5}
+    "shopping": {"active": 0, "active_up": true, "ready_count": 1, "managed": 2, "idle": false},
+    "gitlab":   {"active": 2, "active_up": true, "ready_count": 0, "managed": 1, "idle": true}
   }
 }
 ```
 
-- `"status": "ready"` = every service has at least 1 ready standby
-- `"status": "warming"` = some services have 0 ready standbys (reset may fail)
+Overall `status`:
+- `"ready"` = every service is serving **and** has at least one warm standby (instant resets).
+- `"serving"` = every service is serving, but some standbys are still warming (a reset may briefly return 503).
+- `"warming"` = at least one service's active container is not up yet.
+
+Per-service fields: `active_up` (is the active container serving), `ready_count` (warm standbys available now), `managed` (total instances currently kept), `idle` (no reset within the idle timeout — running at min size).
+
+### Other endpoints
+
+```
+GET http://localhost:7565/shrink   # force every pool down to its min size now
+GET http://localhost:7565/retry    # reconcile now: retry failed, warm/shrink as needed
+```
 
 ### Response codes
 
@@ -150,7 +183,14 @@ Returns:
 |------|---------|
 | 200 | Reset complete |
 | 400 | Unknown service name |
-| 503 | No ready standby (extra instance spawned for next time) |
+| 503 | No ready standby yet (warming; retry shortly) |
+
+### Tuning (environment variables)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `WEBARENA_IDLE_TIMEOUT` | `1800` | Seconds without a reset before a service is shrunk to its min size. |
+| `WEBARENA_WARMER_INTERVAL` | `15` | How often (seconds) the warmer reconciles pools. |
 
 ## Restarting the server
 

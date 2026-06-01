@@ -2,12 +2,24 @@
 """Hot-swap container reset server for Webarena.
 
 Maintains a pool of container instances per service. Resets are near-instant:
-swap iptables rules to point at a ready standby, then rebuild the old one in
-the background.
+swap the nginx upstream to a ready standby, then rebuild the old one in the
+background.
+
+Design goals (see README "Architecture"):
+  * Robust against flaky podman: every container *boot* (create + start) goes
+    through a single global lock, so we never launch more than one container at
+    a time even when many resets arrive at once. Transient podman errors are
+    retried with backoff.
+  * Frugal with resources: a service only keeps warm standbys while it is being
+    used. Services left idle past IDLE_TIMEOUT shrink back to just their active
+    container. A background warmer thread reconciles each pool toward its
+    desired size.
+  * Fast to come up: --init boots only the active container per service, so the
+    stack starts serving quickly; standbys warm in the background.
 
 Usage:
-    python3 server.py --port 7565 --init   # first-time: create all instances + iptables
-    python3 server.py --port 7565          # normal start: resume from persisted state
+    python3 server.py --port 7565 --init   # first-time: create actives + nginx
+    python3 server.py --port 7565          # normal start: resume from state
 """
 
 import argparse
@@ -40,8 +52,14 @@ logger.addHandler(handler)
 # ---------------------------------------------------------------------------
 # image: image name used with `podman create`
 # container_port: port the service listens on *inside* the container
-# public_port: port exposed to clients (iptables redirects here)
-# pool_size: how many container instances to keep
+# public_port: port exposed to clients (nginx proxies here)
+# warm_target (pool_size): standbys+active to keep warm while the service is
+#   being used. Reset hot-swaps to a standby, so warm_target>=2 gives instant
+#   resets.
+# min_pool_size: instances to keep when the service has been idle past
+#   IDLE_TIMEOUT (1 == just the active container, nothing wasted).
+# max_pool_size: hard cap on instances (also bounds the port range needed).
+# port_range_size: size of the reserved host-port range for this service.
 # create_args: extra args for `podman create` (volumes, env, cmd…)
 # health_check: how to verify the container is ready
 #   - type "exec": run a command inside the container
@@ -59,6 +77,7 @@ SERVICES = {
         "port_base": 18280,
         "port_range_size": 16,
         "pool_size": 2,
+        "min_pool_size": 1,
         "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
@@ -70,6 +89,7 @@ SERVICES = {
         "port_base": 18380,
         "port_range_size": 16,
         "pool_size": 2,
+        "min_pool_size": 1,
         "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
@@ -81,6 +101,7 @@ SERVICES = {
         "port_base": 18080,
         "port_range_size": 16,
         "pool_size": 2,
+        "min_pool_size": 1,
         "max_pool_size": 2,
         "create_args": [],
         "health_check": {"type": "exec", "cmd": "curl -sf http://localhost", "timeout": 360},
@@ -92,6 +113,7 @@ SERVICES = {
         "port_base": 19001,
         "port_range_size": 16,
         "pool_size": 5,
+        "min_pool_size": 1,
         "max_pool_size": 6,
         "create_args": [],
         "create_cmd": ["/opt/gitlab/embedded/bin/runsvdir-start"],
@@ -152,6 +174,26 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "pool_state.json")
 MAX_TCP_PORT = 65535
 
 # ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+# Serialize the expensive part of bringing a container up (podman create +
+# start) across the whole process. podman is happy serving traffic from many
+# containers, but launching several at once is a common source of transient
+# failures ("database is locked", OOM during boot, etc). Health checks are NOT
+# held under this lock, so multiple services still warm concurrently.
+_BOOT_LOCK = threading.Lock()
+
+# nginx config is a single shared file + reload; serialize writers.
+_NGINX_LOCK = threading.Lock()
+
+# A service with no reset for this many seconds is considered idle and is
+# shrunk back to min_pool_size (just its active container).
+IDLE_TIMEOUT = int(os.environ.get("WEBARENA_IDLE_TIMEOUT", str(30 * 60)))
+
+# How often the background warmer reconciles pools toward their desired size.
+WARMER_INTERVAL = int(os.environ.get("WEBARENA_WARMER_INTERVAL", "15"))
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -186,6 +228,29 @@ def is_port_conflict_error(error_text: str | None) -> bool:
     )
 
 
+_TRANSIENT_MARKERS = (
+    "database is locked",
+    "temporarily unavailable",
+    "resource temporarily unavailable",
+    "layer not known",
+    "error acquiring lock",
+    "connection refused",
+    "cannot connect",
+    "timed out",
+    "timeout",
+    "device or resource busy",
+    "no space left on device",  # may clear after a previous boot finishes/cleans
+)
+
+
+def is_transient_error(error_text: str | None) -> bool:
+    """Heuristic: should we retry this podman failure?"""
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+    return any(marker in lowered for marker in _TRANSIENT_MARKERS)
+
+
 def validate_services_config():
     """Fail fast if configured service port ranges are invalid or overlap."""
     reserved_ports = {7565}
@@ -198,6 +263,14 @@ def validate_services_config():
 
     for service_name, config in SERVICES.items():
         max_instances = config.get("max_pool_size", config["pool_size"])
+        min_instances = config.get("min_pool_size", 1)
+        if min_instances < 1:
+            raise ValueError(f"{service_name}: min_pool_size must be >= 1")
+        if min_instances > max_instances:
+            raise ValueError(
+                f"{service_name}: min_pool_size={min_instances} exceeds "
+                f"max_pool_size={max_instances}"
+            )
         range_size = config["port_range_size"]
         if range_size < max_instances:
             raise ValueError(
@@ -239,7 +312,7 @@ _port_mappings: dict[int, int] = {}  # public_port → target_port
 
 
 def _write_nginx_conf():
-    """Write nginx config and reload."""
+    """Write nginx config and reload. Caller must hold _NGINX_LOCK."""
     blocks = []
     for public_port, target_port in sorted(_port_mappings.items()):
         blocks.append(f"""server {{
@@ -261,24 +334,30 @@ def _write_nginx_conf():
 
 def set_redirect(public_port: int, target_port: int):
     """Update nginx to proxy `public_port` → `target_port` and reload."""
-    _port_mappings[public_port] = target_port
-    _write_nginx_conf()
+    with _NGINX_LOCK:
+        _port_mappings[public_port] = target_port
+        _write_nginx_conf()
     logger.info("nginx: %d → %d", public_port, target_port)
 
 
 def cleanup_nginx():
     """Remove our nginx config and reload."""
-    if os.path.exists(NGINX_CONF_FILE):
-        os.remove(NGINX_CONF_FILE)
-        subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
-    _port_mappings.clear()
+    with _NGINX_LOCK:
+        if os.path.exists(NGINX_CONF_FILE):
+            os.remove(NGINX_CONF_FILE)
+            subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
+        _port_mappings.clear()
 
 # ---------------------------------------------------------------------------
 # ContainerManager — thin wrapper around podman
 # ---------------------------------------------------------------------------
 
 class ContainerManager:
-    """Manages container lifecycle via podman subprocess calls."""
+    """Manages container lifecycle via podman subprocess calls.
+
+    create() and start() retry transient podman failures with backoff so a
+    single flaky launch doesn't permanently fail an instance.
+    """
 
     def exists(self, name: str) -> bool:
         r = subprocess.run(
@@ -291,7 +370,8 @@ class ContainerManager:
                extra_args: list[str] | None = None,
                cmd: list[str] | None = None,
                env: dict[str, str] | None = None,
-               volumes: dict[str, str] | None = None) -> tuple[bool, str | None]:
+               volumes: dict[str, str] | None = None,
+               attempts: int = 3) -> tuple[bool, str | None]:
         args = ["podman", "create", "--name", name, "-p", port_mapping]
         if env:
             for k, v in env.items():
@@ -304,25 +384,49 @@ class ContainerManager:
         args.append(image)
         if cmd:
             args += cmd
-        try:
-            run(args, timeout=60)
-            logger.info("Created container %s", name)
-            return True, None
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            stderr = getattr(e, "stderr", None)
-            stdout = getattr(e, "stdout", None)
-            details = stderr or stdout or str(e)
-            logger.error("Failed to create %s: %s", name, details)
-            return False, details
 
-    def start(self, name: str) -> bool:
-        try:
-            run(["podman", "start", name], timeout=60)
-            logger.info("Started container %s", name)
-            return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.error("Failed to start %s: %s", name, e)
-            return False
+        for attempt in range(1, attempts + 1):
+            try:
+                run(args, timeout=90)
+                logger.info("Created container %s", name)
+                return True, None
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                stderr = getattr(e, "stderr", None)
+                stdout = getattr(e, "stdout", None)
+                details = stderr or stdout or str(e)
+                # Port conflicts must bubble up so the caller can pick another port.
+                if is_port_conflict_error(details):
+                    return False, details
+                retryable = isinstance(e, subprocess.TimeoutExpired) or is_transient_error(details)
+                if attempt < attempts and retryable:
+                    logger.warning("Create %s failed (attempt %d/%d, transient): %s",
+                                   name, attempt, attempts, str(details).strip()[:200])
+                    # Clear any half-created container before retrying.
+                    subprocess.run(["podman", "rm", "-f", name],
+                                   capture_output=True, check=False, timeout=30)
+                    time.sleep(2 * attempt)
+                    continue
+                logger.error("Failed to create %s: %s", name, details)
+                return False, details
+        return False, "create failed"
+
+    def start(self, name: str, attempts: int = 3) -> bool:
+        for attempt in range(1, attempts + 1):
+            try:
+                run(["podman", "start", name], timeout=90)
+                logger.info("Started container %s", name)
+                return True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                stderr = getattr(e, "stderr", None)
+                details = stderr or str(e)
+                if attempt < attempts:
+                    logger.warning("Start %s failed (attempt %d/%d): %s",
+                                   name, attempt, attempts, str(details).strip()[:200])
+                    time.sleep(2 * attempt)
+                    continue
+                logger.error("Failed to start %s: %s", name, details)
+                return False
+        return False
 
     def stop(self, name: str, timeout: int = 10) -> bool:
         try:
@@ -393,38 +497,63 @@ cm = ContainerManager()
 # ---------------------------------------------------------------------------
 
 class ServicePool:
-    """Manages a pool of container instances for one service."""
+    """Manages a pool of container instances for one service.
+
+    Instance states:
+      "active"     — currently serving traffic (exactly one).
+      "ready"      — warm standby, can be swapped to instantly.
+      "rebuilding" — boot in progress (counts toward the pool, not swappable).
+      "failed"     — boot failed; the warmer will retry it.
+
+    Only instances we intend to keep appear in `self.instances`; removing an
+    instance deletes its key. Pool sizing is usage-based:
+      * `warm_target` warm instances while the service is being used,
+      * shrunk to `min_size` once idle past IDLE_TIMEOUT,
+      * never above `max_pool_size`.
+    The background warmer reconciles toward this target; boots are serialized
+    process-wide via _BOOT_LOCK.
+    """
 
     def __init__(self, service_name: str, config: dict, state: dict | None = None):
         self.name = service_name
         self.config = config
-        self.pool_size = config["pool_size"]
-        self.max_pool_size = config.get("max_pool_size", self.pool_size)
+        # warm_target: warm instances to keep while in active use.
+        self.warm_target = config["pool_size"]
+        # min_size: warm instances to keep when idle (1 == just the active).
+        self.min_size = config.get("min_pool_size", 1)
+        self.max_pool_size = config.get("max_pool_size", self.warm_target)
         self.public_port = config["public_port"]
         self.port_base = config["port_base"]
         self.port_range_size = config["port_range_size"]
-        self.lock = threading.Lock()
+        # Reentrant: reconcile()/swap() hold the lock while calling helpers and
+        # rebuild callbacks re-take it to publish final state.
+        self.lock = threading.RLock()
 
         if state:
-            self.active = state["active"]
-            self.instances = {int(k): v for k, v in state["instances"].items()}
-            saved_ports = state.get("ports", {})
-            self.ports = {int(k): int(v) for k, v in saved_ports.items()}
-            # Restore pool_size from state (may have grown beyond initial)
-            if self.instances:
-                self.pool_size = max(self.pool_size, max(self.instances.keys()) + 1)
+            self.active = state.get("active", 0)
+            self.instances = {int(k): v for k, v in state.get("instances", {}).items()}
+            self.ports = {int(k): int(v) for k, v in state.get("ports", {}).items()}
+            # last_used drives idle-shrink. Default to "long ago" so a resumed
+            # but unused service stays minimal until something resets it.
+            self.last_used = float(state.get("last_used", 0.0))
         else:
             self.active = 0
-            self.instances = {i: "pending" for i in range(self.pool_size)}
+            self.instances = {0: "pending"}
             self.ports = {}
+            # 0.0 == "never used": a freshly-initialised service stays at
+            # min_size (active only) until its first reset.
+            self.last_used = 0.0
 
         self._hydrate_ports_from_runtime()
+
+    # -- persistence --------------------------------------------------------
 
     def state_dict(self) -> dict:
         return {
             "active": self.active,
             "instances": {str(k): v for k, v in self.instances.items()},
             "ports": {str(k): v for k, v in self.ports.items()},
+            "last_used": self.last_used,
         }
 
     def _hydrate_ports_from_runtime(self):
@@ -435,6 +564,8 @@ class ServicePool:
             host_port = cm.get_host_port(self._container_name(index), self.config["container_port"])
             if host_port is not None:
                 self.ports[index] = host_port
+
+    # -- naming / ports -----------------------------------------------------
 
     def _preferred_host_port(self, index: int) -> int:
         return preferred_host_port(self.config, index)
@@ -464,7 +595,36 @@ class ServicePool:
             candidates.append(port)
         return candidates
 
+    def _next_index(self) -> int | None:
+        """Smallest unused instance index within the reserved range."""
+        for i in range(self.port_range_size):
+            if i not in self.instances:
+                return i
+        return None
+
+    # -- counts -------------------------------------------------------------
+
+    def managed_count(self) -> int:
+        return len(self.instances)
+
+    def ready_count(self) -> int:
+        return sum(1 for s in self.instances.values() if s == "ready")
+
+    def _desired_warm(self) -> int:
+        """How many warm instances we want right now, based on recent usage."""
+        idle = (time.time() - self.last_used) > IDLE_TIMEOUT
+        desired = self.min_size if idle else self.warm_target
+        return max(self.min_size, min(desired, self.max_pool_size))
+
+    def mark_used(self):
+        with self.lock:
+            self.last_used = time.time()
+
+    # -- container boot (serialized) ---------------------------------------
+
     def _create_instance(self, index: int) -> bool:
+        """Create (not start) the container, picking a free host port. Must be
+        called under _BOOT_LOCK so concurrent boots don't race on ports."""
         name = self._container_name(index)
         for host_port in self._candidate_ports(index):
             if not is_port_free(host_port):
@@ -489,227 +649,249 @@ class ServicePool:
         self.ports.pop(index, None)
         return False
 
-    def _health_check(self, index: int) -> bool:
+    def _health_check(self, index: int, timeout: int | None = None) -> bool:
         hc = self.config["health_check"]
         name = self._container_name(index)
-        timeout = hc.get("timeout", 60)
+        t = timeout if timeout is not None else hc.get("timeout", 60)
         if hc["type"] == "exec":
-            return cm.health_check_exec(name, hc["cmd"], timeout)
+            return cm.health_check_exec(name, hc["cmd"], t)
         elif hc["type"] == "http":
-            url = hc["url_template"].format(host_port=self._host_port(index))
-            return cm.health_check_http(url, timeout)
+            url = hc["url"].format(host_port=self._host_port(index))
+            return cm.health_check_http(url, t)
         return False
 
-    def init_all(self):
-        """Create, start, and health-check all instances one at a time."""
-        logger.info("[%s] Initializing %d instances...", self.name, self.pool_size)
-        for i in range(self.pool_size):
-            name = self._container_name(i)
-            # Clean up any existing container
+    def _boot(self, index: int) -> bool:
+        """Bring an instance up: (re)create + start under the global boot lock,
+        then health-check outside the lock. Returns True if healthy.
+
+        Only the create+start burst is serialized — health checks (the slow
+        part) overlap across services so warming stays fast."""
+        name = self._container_name(index)
+        with _BOOT_LOCK:
             cm.stop(name)
             cm.rm(name)
-            # Create and start
-            if not self._create_instance(i):
-                self.instances[i] = "failed"
-                continue
+            if not self._create_instance(index):
+                return False
             if not cm.start(name):
-                self.instances[i] = "failed"
-                continue
-            # Health-check before starting next instance
-            self._init_health_check(i)
+                return False
 
-        # Set up iptables for active instance
-        if self.instances.get(self.active) == "ready":
-            set_redirect(self.public_port, self._host_port(self.active))
-            self.instances[self.active] = "active"
-        else:
-            # Find any ready instance to be active
-            for i in range(self.pool_size):
-                if self.instances[i] == "ready":
-                    self.active = i
-                    set_redirect(self.public_port, self._host_port(i))
-                    self.instances[i] = "active"
-                    break
-            else:
-                logger.error("[%s] No instances became ready!", self.name)
-
-        logger.info("[%s] Init complete. Active=%d, states=%s", self.name, self.active, self.instances)
-
-    def _init_health_check(self, index: int):
-        name = self._container_name(index)
-        logger.info("[%s] Health-checking %s...", self.name, name)
         if self._health_check(index):
-            self.instances[index] = "ready"
-            logger.info("[%s] %s is ready", self.name, name)
-        else:
-            # Retry once: restart the container and health-check again
-            logger.warning("[%s] %s failed health check, restarting and retrying...", self.name, name)
+            return True
+
+        # Retry once: restart and health-check again (boot serialized).
+        logger.warning("[%s] %s failed health check, restarting and retrying...", self.name, name)
+        with _BOOT_LOCK:
             cm.stop(name)
             cm.start(name)
-            if self._health_check(index):
-                self.instances[index] = "ready"
-                logger.info("[%s] %s is ready after retry", self.name, name)
+        return self._health_check(index)
+
+    def _rebuild(self, index: int):
+        """Boot an instance in the current thread and publish its final state.
+
+        If it is (still) the active instance, restore the nginx redirect."""
+        name = self._container_name(index)
+        logger.info("[%s] Building %s...", self.name, name)
+        ok = self._boot(index)
+        with self.lock:
+            if ok:
+                if index == self.active:
+                    self.instances[index] = "active"
+                    set_redirect(self.public_port, self._host_port(index))
+                    logger.info("[%s] %s rebuilt (active)", self.name, name)
+                else:
+                    self.instances[index] = "ready"
+                    logger.info("[%s] %s ready", self.name, name)
             else:
                 self.instances[index] = "failed"
-                logger.error("[%s] %s failed health check after retry", self.name, name)
+                logger.error("[%s] %s failed to build", self.name, name)
 
-    def get_next_ready(self) -> int | None:
-        """Find the next ready instance (round-robin from current active)."""
-        for offset in range(1, self.pool_size):
-            idx = (self.active + offset) % self.pool_size
-            if self.instances.get(idx) == "ready":
-                return idx
-        return None
-
-    def _spawn_extra(self):
-        """Add a new instance to the pool in the background, respecting max_pool_size."""
-        if self.pool_size >= self.max_pool_size:
-            logger.warning("[%s] Pool at max size (%d), not spawning extra",
-                           self.name, self.max_pool_size)
-            # Try to retry a failed instance instead
-            self._retry_failed()
-            return
-        new_idx = self.pool_size
-        self.pool_size += 1
-        self.instances[new_idx] = "rebuilding"
-        logger.info("[%s] Spawning extra instance %d (pool now %d, max %d)",
-                    self.name, new_idx, self.pool_size, self.max_pool_size)
+    def _spawn_rebuild(self, index: int):
         t = threading.Thread(
-            target=self._rebuild, args=(new_idx,),
-            name=f"spawn-{self.name}-{new_idx}", daemon=True,
+            target=self._rebuild, args=(index,),
+            name=f"boot-{self.name}-{index}", daemon=True,
         )
         t.start()
 
-    def _retry_failed(self):
-        """Retry the first failed instance: health-check first, rebuild only if needed."""
-        for idx, state in self.instances.items():
-            if state == "failed":
-                self.instances[idx] = "rebuilding"
-                logger.info("[%s] Retrying failed instance %d", self.name, idx)
-                t = threading.Thread(
-                    target=self._retry_or_rebuild, args=(idx,),
-                    name=f"retry-{self.name}-{idx}", daemon=True,
-                )
-                t.start()
-                return True
-        return False
+    # -- lifecycle ----------------------------------------------------------
 
-    def _retry_or_rebuild(self, index: int):
-        """Check if a failed instance is actually healthy; rebuild only if not."""
-        name = self._container_name(index)
-        # Try health-checking the existing container first
-        if cm.exists(name) and self._health_check(index):
-            self.instances[index] = "ready"
-            logger.info("[%s] %s is already healthy, marked ready", self.name, name)
+    def init_active(self):
+        """Boot only the active instance. Standbys warm later, on demand."""
+        self.active = 0
+        self.ports.pop(0, None)
+        self.instances = {0: "rebuilding"}
+        name = self._container_name(0)
+        logger.info("[%s] Booting active instance %s...", self.name, name)
+        if self._boot(0):
+            with self.lock:
+                self.instances[0] = "active"
+            set_redirect(self.public_port, self._host_port(0))
+            logger.info("[%s] active ready on host port %d", self.name, self._host_port(0))
+        else:
+            with self.lock:
+                self.instances[0] = "failed"
+            logger.error("[%s] active instance failed to boot!", self.name)
+
+    def resume_active(self):
+        """On resume: keep/verify the active container, forget standbys, and let
+        the warmer re-create standbys as usage dictates. Leftover standby
+        containers from the previous run are removed to free resources."""
+        with self.lock:
+            active = self.active
+            for idx in list(self.instances):
+                if idx != active:
+                    del self.instances[idx]
+                    self.ports.pop(idx, None)
+
+        # Best-effort cleanup of any leftover standby containers.
+        for i in range(self.port_range_size):
+            if i != self.active:
+                cm.rm(self._container_name(i))
+
+        name = self._container_name(self.active)
+        if cm.exists(name) and self._health_check(self.active, timeout=10):
+            with self.lock:
+                self.instances[self.active] = "active"
+            set_redirect(self.public_port, self._host_port(self.active))
+            logger.info("[%s] resumed active %s", self.name, name)
             return
-        # Not healthy — full rebuild
-        self._rebuild(index)
+
+        logger.warning("[%s] active %s not healthy on resume, rebuilding", self.name, name)
+        with self.lock:
+            self.instances = {self.active: "rebuilding"}
+        self._rebuild(self.active)
+
+    # -- swap (reset) -------------------------------------------------------
+
+    def get_next_ready(self) -> int | None:
+        """Find the next ready standby (round-robin from the active instance)."""
+        with self.lock:
+            keys = sorted(self.instances.keys())
+            if not keys:
+                return None
+            start = keys.index(self.active) if self.active in keys else -1
+            n = len(keys)
+            for offset in range(1, n + 1):
+                idx = keys[(start + offset) % n]
+                if idx == self.active:
+                    continue
+                if self.instances.get(idx) == "ready":
+                    return idx
+        return None
 
     def swap(self) -> tuple[bool, str]:
-        """Swap to next ready instance. Returns (success, message)."""
+        """Swap to the next ready standby and rebuild the old active.
+
+        Returns (success, message). Marks the service used so the warmer keeps
+        it warm; if no standby is ready, returns False (the warmer will warm one
+        for next time)."""
+        old_idx = None
         with self.lock:
+            self.last_used = time.time()
             next_idx = self.get_next_ready()
             if next_idx is None:
-                # No standby ready — try retrying a failed instance first,
-                # then spawn extra only if under max_pool_size
-                if not self._retry_failed():
-                    self._spawn_extra()
                 return False, f"No ready standby for: {self.name}"
 
             old_idx = self.active
-
-            # Swap nginx
             set_redirect(self.public_port, self._host_port(next_idx))
-
-            # Update state
             self.instances[next_idx] = "active"
             self.instances[old_idx] = "rebuilding"
             self.active = next_idx
-
-            # If no more standbys after this swap, grow the pool
-            if self.ready_count() == 0:
-                if not self._retry_failed():
-                    self._spawn_extra()
-
             logger.info("[%s] Swapped %d → %d", self.name, old_idx, next_idx)
 
-        # Rebuild old instance in background
-        t = threading.Thread(
-            target=self._rebuild, args=(old_idx,),
-            name=f"rebuild-{self.name}-{old_idx}", daemon=True,
-        )
-        t.start()
-
+        # Rebuild the old instance in the background (serialized via boot lock).
+        self._spawn_rebuild(old_idx)
         return True, "ok"
 
-    def _rebuild(self, index: int):
-        """Destroy old container, recreate, start, health-check."""
-        name = self._container_name(index)
-        logger.info("[%s] Rebuilding %s...", self.name, name)
+    # -- reconciliation (the warmer) ---------------------------------------
 
-        cm.stop(name)
-        cm.rm(name)
+    def reconcile(self):
+        """Move the pool toward its desired warm size.
 
-        if not self._create_instance(index):
-            self.instances[index] = "failed"
-            logger.error("[%s] Failed to create %s", self.name, name)
-            return
-
-        if not cm.start(name):
-            self.instances[index] = "failed"
-            logger.error("[%s] Failed to start %s", self.name, name)
-            return
-
-        if self._health_check(index):
-            self.instances[index] = "ready"
-            logger.info("[%s] %s rebuilt and ready", self.name, name)
-        else:
-            # Retry once: restart and health-check again
-            logger.warning("[%s] %s failed health check after rebuild, restarting...", self.name, name)
-            cm.stop(name)
-            cm.start(name)
-            if self._health_check(index):
-                self.instances[index] = "ready"
-                logger.info("[%s] %s ready after retry", self.name, name)
-            else:
-                self.instances[index] = "failed"
-                logger.error("[%s] %s failed health check after retry", self.name, name)
-
-    def ready_count(self) -> int:
-        return sum(1 for s in self.instances.values() if s == "ready")
-
-    def shrink_to_max(self):
-        """Remove failed instances beyond max_pool_size."""
-        removed = []
+        Called periodically by the warmer thread:
+          1. self-heal a failed active container,
+          2. shrink excess standbys when idle (frees resources),
+          3. retry remaining failed standbys,
+          4. grow warm standbys up to the desired size (only when in use).
+        All boots are spawned as background threads; _BOOT_LOCK ensures only one
+        container is actually created+started at a time."""
+        to_spawn: list[int] = []
         with self.lock:
-            # Collect indices to remove: failed instances with index >= max_pool_size
-            to_remove = sorted(
-                idx for idx, state in self.instances.items()
-                if state == "failed" and idx >= self.config["pool_size"]
+            desired = self._desired_warm()
+
+            # 1. Critical: a dead active must come back no matter what.
+            if self.instances.get(self.active) == "failed":
+                self.instances[self.active] = "rebuilding"
+                to_spawn.append(self.active)
+
+            # 2. Shrink excess warm/failed standbys (idle → free resources).
+            if self.managed_count() > desired:
+                self._shrink_to(desired)
+
+            # 3. Retry the failed standbys we still intend to keep.
+            for idx, st in sorted(self.instances.items()):
+                if st == "failed":
+                    self.instances[idx] = "rebuilding"
+                    to_spawn.append(idx)
+
+            # 4. Grow toward desired (no-op for idle services).
+            while self.managed_count() < desired:
+                idx = self._next_index()
+                if idx is None:
+                    break
+                self.instances[idx] = "rebuilding"
+                to_spawn.append(idx)
+                logger.info("[%s] Warming new instance %d (target %d)",
+                            self.name, idx, desired)
+
+        for idx in to_spawn:
+            self._spawn_rebuild(idx)
+
+    def _shrink_to(self, target: int) -> list[int]:
+        """Remove removable (ready/failed, non-active) standbys, highest index
+        first, until managed_count() <= target. Caller holds self.lock."""
+        removed = []
+        while self.managed_count() > target:
+            candidates = sorted(
+                (idx for idx, st in self.instances.items()
+                 if idx != self.active and st in ("ready", "failed")),
+                reverse=True,
             )
-            while self.pool_size > self.max_pool_size and to_remove:
-                idx = to_remove.pop()
-                name = self._container_name(idx)
-                cm.stop(name)
-                cm.rm(name)
-                del self.instances[idx]
-                self.ports.pop(idx, None)
-                removed.append(idx)
-                self.pool_size -= 1
+            if not candidates:
+                break  # only active / in-flight boots remain; can't shrink now
+            idx = candidates[0]
+            name = self._container_name(idx)
+            cm.stop(name)
+            cm.rm(name)
+            del self.instances[idx]
+            self.ports.pop(idx, None)
+            removed.append(idx)
         if removed:
-            logger.info("[%s] Shrunk pool: removed instances %s (pool now %d)",
-                        self.name, removed, self.pool_size)
+            logger.info("[%s] Shrunk pool: removed instances %s (now %d)",
+                        self.name, removed, self.managed_count())
         return removed
 
+    def shrink_idle(self) -> list[int]:
+        """Force-shrink to min_size (used by the /shrink endpoint)."""
+        with self.lock:
+            return self._shrink_to(self.min_size)
+
+    # -- introspection ------------------------------------------------------
+
     def status_dict(self) -> dict:
-        return {
-            "active": self.active,
-            "ready_count": self.ready_count(),
-            "total": self.pool_size,
-            "max_pool_size": self.max_pool_size,
-            "instances": dict(self.instances),
-            "ports": dict(self.ports),
-        }
+        with self.lock:
+            return {
+                "active": self.active,
+                "active_up": self.instances.get(self.active) == "active",
+                "ready_count": self.ready_count(),
+                "managed": self.managed_count(),
+                "desired_warm": self._desired_warm(),
+                "warm_target": self.warm_target,
+                "min_size": self.min_size,
+                "max_pool_size": self.max_pool_size,
+                "idle": (time.time() - self.last_used) > IDLE_TIMEOUT,
+                "instances": dict(self.instances),
+                "ports": dict(self.ports),
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +905,8 @@ class HotSwapServer:
         self.state_file = state_file
         self.pools: dict[str, ServicePool] = {}
         self._save_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._warmer: threading.Thread | None = None
 
     def _load_state(self) -> dict | None:
         if os.path.exists(self.state_file):
@@ -767,19 +951,21 @@ class HotSwapServer:
                 name = spec["name"]
                 cm.stop(name)
                 cm.rm(name)
-                ok, _ = cm.create(
-                    name=name,
-                    image=spec["image"],
-                    port_mapping=spec["port_mapping"],
-                    extra_args=spec.get("extra_args"),
-                    cmd=spec.get("cmd"),
-                    env=spec.get("env"),
-                    volumes=spec.get("volumes"),
-                )
-                if not ok:
-                    logger.error("Failed to create static container %s", name)
-                    continue
-                cm.start(name)
+                # Static boots also go through the global boot lock.
+                with _BOOT_LOCK:
+                    ok, _ = cm.create(
+                        name=name,
+                        image=spec["image"],
+                        port_mapping=spec["port_mapping"],
+                        extra_args=spec.get("extra_args"),
+                        cmd=spec.get("cmd"),
+                        env=spec.get("env"),
+                        volumes=spec.get("volumes"),
+                    )
+                    if not ok:
+                        logger.error("Failed to create static container %s", name)
+                        continue
+                    cm.start(name)
 
             # Health-check static containers
             for spec in containers:
@@ -818,20 +1004,32 @@ class HotSwapServer:
         logger.info("All containers removed")
 
     def init(self):
-        """First-time setup: create all pool instances and configure nginx."""
+        """First-time setup: boot one active per service, configure nginx.
+
+        Standbys are NOT booted here — they warm on demand (first reset), which
+        makes the stack start serving in a fraction of the old time."""
         self._kill_all_containers()
         self._ensure_nginx()
         self._init_static_services()
-        logger.info("=== Initializing service pools sequentially ===")
+        logger.info("=== Booting active instances ===")
         for name, config in self.services_config.items():
-            pool = ServicePool(name, config)
-            self.pools[name] = pool
-            pool.init_all()
+            self.pools[name] = ServicePool(name, config)
+        # Boot actives concurrently; _BOOT_LOCK serializes the podman work while
+        # health checks overlap, so this is as fast as podman safely allows.
+        threads = []
+        for pool in self.pools.values():
+            t = threading.Thread(target=pool.init_active,
+                                 name=f"init-{pool.name}", daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
         self._save_state()
-        logger.info("=== Initialization complete ===")
+        logger.info("=== Active instances up; standbys will warm on demand ===")
 
     def resume(self):
-        """Resume from persisted state. Re-establish nginx rules."""
+        """Resume from persisted state. Verify actives, re-establish nginx, and
+        let the warmer re-create standbys as usage dictates."""
         self._ensure_nginx()
         self._init_static_services()
 
@@ -842,20 +1040,24 @@ class HotSwapServer:
 
         for name, config in self.services_config.items():
             state = saved.get(name)
-            pool = ServicePool(name, config, state=state)
-            # Re-establish iptables for the active instance
-            active = pool.active
-            if pool.instances.get(active) in ("active", "ready") and cm.exists(pool._container_name(active)):
-                set_redirect(pool.public_port, pool._host_port(active))
-                pool.instances[active] = "active"
-            self.pools[name] = pool
+            self.pools[name] = ServicePool(name, config, state=state)
 
-        logger.info("Resumed from state file. Services: %s",
-                     {n: p.active for n, p in self.pools.items()})
+        threads = []
+        for pool in self.pools.values():
+            t = threading.Thread(target=pool.resume_active,
+                                 name=f"resume-{pool.name}", daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        self._save_state()
+        logger.info("Resumed. Services: %s",
+                    {n: p.active for n, p in self.pools.items()})
 
     def reset(self, services: list[str] | None = None) -> tuple[int, str]:
         """Swap specified services (or all). All-or-nothing: only swaps if every
-        target service has a ready standby."""
+        target service has a ready standby. Marks targets used either way so the
+        warmer keeps/brings them warm."""
         targets = services if services else list(self.pools.keys())
 
         # Validate service names
@@ -863,43 +1065,69 @@ class HotSwapServer:
         if invalid:
             return 400, f"Unknown services: {', '.join(invalid)}"
 
-        # Pre-check: ensure all targets have a ready standby before swapping any
-        not_ready = []
+        # Mark all targets used so the warmer keeps them warm (even on 503).
         for name in targets:
-            pool = self.pools[name]
-            if pool.get_next_ready() is None:
-                not_ready.append(name)
-                # Kick off retry/spawn so they'll be ready next time
-                with pool.lock:
-                    if not pool._retry_failed():
-                        pool._spawn_extra()
+            self.pools[name].mark_used()
 
+        # Pre-check: ensure all targets have a ready standby before swapping any.
+        not_ready = [name for name in targets if self.pools[name].get_next_ready() is None]
         if not_ready:
             self._save_state()
-            return 503, f"No ready standby for: {', '.join(not_ready)}"
+            return 503, (f"No ready standby for: {', '.join(not_ready)} "
+                         f"(warming, retry shortly)")
 
-        # All services have standbys — commit the swap
-        for name in targets:
-            self.pools[name].swap()
-
+        # All services have standbys — commit the swap. A concurrent reset
+        # could still steal a standby between the pre-check and here, so honor
+        # each swap's result.
+        failed = [name for name in targets if not self.pools[name].swap()[0]]
         self._save_state()
+        if failed:
+            return 503, (f"No ready standby for: {', '.join(failed)} "
+                         f"(warming, retry shortly)")
         return 200, "Reset complete"
 
     def status(self) -> dict:
         svc_status = {name: pool.status_dict() for name, pool in self.pools.items()}
-        all_have_standbys = all(pool.ready_count() > 0 for pool in self.pools.values())
-        return {
-            "status": "ready" if all_have_standbys else "warming",
-            "services": svc_status,
-        }
+        # "ready" = every service is actively serving. Standby availability is
+        # reported per-service; idle services intentionally keep no standby.
+        all_active_up = all(s["active_up"] for s in svc_status.values())
+        all_have_standbys = all(s["ready_count"] > 0 for s in svc_status.values())
+        if not all_active_up:
+            overall = "warming"
+        elif all_have_standbys:
+            overall = "ready"
+        else:
+            overall = "serving"  # actives up, some standbys still warming
+        return {"status": overall, "services": svc_status}
+
+    def start_warmer(self):
+        """Start the background reconciliation loop."""
+        if self._warmer and self._warmer.is_alive():
+            return
+        self._warmer = threading.Thread(target=self._warmer_loop,
+                                        name="warmer", daemon=True)
+        self._warmer.start()
+        logger.info("Warmer started (interval=%ds, idle_timeout=%ds)",
+                    WARMER_INTERVAL, IDLE_TIMEOUT)
+
+    def _warmer_loop(self):
+        while not self._stop.is_set():
+            try:
+                for pool in list(self.pools.values()):
+                    pool.reconcile()
+                self._save_state()
+            except Exception:
+                logger.exception("warmer iteration failed")
+            self._stop.wait(WARMER_INTERVAL)
 
     def teardown(self):
         """Stop and remove all managed containers."""
         logger.info("=== Tearing down all containers ===")
+        self._stop.set()
         for name, pool in self.pools.items():
-            for i in range(pool.pool_size):
+            # Remove every index in the reserved range to catch leftovers too.
+            for i in range(pool.port_range_size):
                 cname = pool._container_name(i)
-                logger.info("Stopping %s...", cname)
                 cm.stop(cname)
                 cm.rm(cname)
         cleanup_nginx()
@@ -934,19 +1162,18 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/shrink":
             result = {}
             for name, pool in server_instance.pools.items():
-                removed = pool.shrink_to_max()
+                removed = pool.shrink_idle()
                 if removed:
                     result[name] = f"removed instances {removed}"
             server_instance._save_state()
             self._respond(200, {"message": "Shrink complete", "result": result})
 
         elif path == "/retry":
-            result = {}
-            for name, pool in server_instance.pools.items():
-                if pool._retry_failed():
-                    result[name] = "retrying a failed instance"
+            # Kick a reconcile so failed instances are retried immediately.
+            for pool in server_instance.pools.values():
+                pool.reconcile()
             server_instance._save_state()
-            self._respond(200, {"message": "Retry triggered", "result": result})
+            self._respond(200, {"message": "Reconcile triggered"})
 
         else:
             self._respond(404, {"message": "Not found. Use /reset, /status, /shrink, or /retry"})
@@ -971,7 +1198,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hot-swap container reset server")
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
     parser.add_argument("--init", action="store_true",
-                        help="First-time init: create all container instances and set up iptables")
+                        help="First-time init: boot active instances and set up nginx")
     parser.add_argument("--state-file", default=STATE_FILE, help="Path to state JSON file")
     args = parser.parse_args()
 
@@ -1019,6 +1246,9 @@ def main():
                         logger.warning("Force-killing old server (pid %d)", old_pid)
                         os.kill(old_pid, signal.SIGKILL)
                         time.sleep(2)
+
+    # Start the background warmer (lazy standby warming + idle shrink).
+    server_instance.start_warmer()
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
     logger.info("Serving on port %d...", args.port)
