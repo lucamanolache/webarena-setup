@@ -176,12 +176,17 @@ MAX_TCP_PORT = 65535
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-# Serialize the expensive part of bringing a container up (podman create +
-# start) across the whole process. podman is happy serving traffic from many
+# Limit the expensive part of bringing a container up (podman create + start)
+# across the whole process. podman is happy serving traffic from many
 # containers, but launching several at once is a common source of transient
 # failures ("database is locked", OOM during boot, etc). Health checks are NOT
-# held under this lock, so multiple services still warm concurrently.
-_BOOT_LOCK = threading.Lock()
+# held under this semaphore, so multiple services still warm concurrently.
+#
+# The number of simultaneous boots is configurable via --max-concurrent-boots
+# (default 1 == only one podman create+start at a time, even under many
+# concurrent resets). main() rebuilds this with the configured value at startup.
+MAX_CONCURRENT_BOOTS = int(os.environ.get("WEBARENA_MAX_CONCURRENT_BOOTS", "1"))
+_BOOT_LOCK = threading.BoundedSemaphore(MAX_CONCURRENT_BOOTS)
 
 # nginx config is a single shared file + reload; serialize writers.
 _NGINX_LOCK = threading.Lock()
@@ -1200,7 +1205,23 @@ def main():
     parser.add_argument("--init", action="store_true",
                         help="First-time init: boot active instances and set up nginx")
     parser.add_argument("--state-file", default=STATE_FILE, help="Path to state JSON file")
+    parser.add_argument(
+        "--max-concurrent-boots", type=int, default=MAX_CONCURRENT_BOOTS,
+        metavar="N",
+        help="Max containers to create+start simultaneously across all services "
+             "(default %(default)s). 1 == one podman boot at a time even under "
+             "many concurrent resets; higher warms faster but loads podman more. "
+             "Env: WEBARENA_MAX_CONCURRENT_BOOTS.",
+    )
     args = parser.parse_args()
+
+    if args.max_concurrent_boots < 1:
+        parser.error("--max-concurrent-boots must be >= 1")
+
+    # Size the global boot semaphore before anything boots (init/resume below).
+    global _BOOT_LOCK
+    _BOOT_LOCK = threading.BoundedSemaphore(args.max_concurrent_boots)
+    logger.info("Max concurrent podman boots: %d", args.max_concurrent_boots)
 
     server_instance = HotSwapServer(SERVICES, STATIC_SERVICES, args.state_file)
 

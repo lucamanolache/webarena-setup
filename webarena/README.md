@@ -109,15 +109,17 @@ The pool size adapts to usage so idle arenas don't burn resources:
 
 Both knobs are environment variables read at startup.
 
-### One podman boot at a time (robustness)
+### Limited concurrent boots (robustness)
 
 Launching many containers concurrently is the main source of flaky podman
-failures. Every container **boot** (`podman create` + `start`) is serialized
-process-wide by a single global lock, so no matter how many resets arrive at
-once, only one container is created/started at a time. Health checks run
-*outside* the lock, so multiple services still warm concurrently — serialization
-adds robustness without serializing the slow part. `podman create`/`start` also
-retry transient failures (e.g. "database is locked") with backoff.
+failures. Every container **boot** (`podman create` + `start`) goes through a
+single process-wide semaphore, so no matter how many resets arrive at once, only
+a bounded number of containers are created/started at a time. By default that
+bound is **1** (one podman boot at a time); raise it with `--max-concurrent-boots N`
+for faster warmup at the cost of more load on podman. Health checks run *outside*
+the semaphore, so multiple services still warm concurrently — the bound only
+applies to the create+start burst. `podman create`/`start` also retry transient
+failures (e.g. "database is locked") with backoff.
 
 ### Reset flow (~0.05s)
 
@@ -185,12 +187,21 @@ GET http://localhost:7565/retry    # reconcile now: retry failed, warm/shrink as
 | 400 | Unknown service name |
 | 503 | No ready standby yet (warming; retry shortly) |
 
-### Tuning (environment variables)
+### Tuning
+
+CLI flag (on `server.py` / `07_serve_reset.sh`):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--max-concurrent-boots N` | `1` | Max containers to create+start simultaneously across all services. `1` = one podman boot at a time even under many concurrent resets; higher warms faster but loads podman more. (Env fallback: `WEBARENA_MAX_CONCURRENT_BOOTS`.) |
+
+Environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `WEBARENA_IDLE_TIMEOUT` | `1800` | Seconds without a reset before a service is shrunk to its min size. |
 | `WEBARENA_WARMER_INTERVAL` | `15` | How often (seconds) the warmer reconciles pools. |
+| `WEBARENA_MAX_CONCURRENT_BOOTS` | `1` | Default for `--max-concurrent-boots` when the flag is omitted. |
 
 ## Restarting the server
 
